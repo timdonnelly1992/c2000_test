@@ -1,0 +1,20 @@
+# Build output
+28003x_RELEASE/
+
+# TI C2000Ware SDK / driverlib (restore from SDK install)
+device/
+
+# Prebuilt libraries (restore from SDK install)
+libraries/
+
+# PDFs / documentation binaries
+*.pdf
+
+# macOS
+.DS_Store
+
+# Clangd cache
+.clangd/
+
+# Theia IDE
+.theia/

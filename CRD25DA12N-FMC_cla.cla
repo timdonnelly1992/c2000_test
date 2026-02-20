@@ -1,0 +1,436 @@
+
+//#############################################################################
+//
+// FILE:    CRD25DA12N-FMC_cla.cla (Wolfspeed CRD25DA12N-FMC Control Law
+//  Accelerator - WS CRD25DA12N-FMC CLA)
+//
+// TITLE:   CRD25DA12N-FMC 25 kW Controller Code
+//
+// AUTHOR:  WOLFSPEED
+//
+// PURPOSE:
+//  Control Law Accelerator (CLA) functions for the Wolfspeed three-phase
+//  CRD25DA12N-FMC reference design. Using the CLA to off-load compute
+//  resources from the primary CPU.
+//
+//#############################################################################
+
+//
+// Included Files
+//
+#include <CRD25DA12N-FMC_shared.h>
+#include <stdint.h>
+#include "libraries/CLAmath/CLAmath.h"
+
+//
+// Function Prototypes
+//
+void updateOpenLoopSinePwmsCla(void);
+void updateClosedLoopCurrentPwmsCla(void);
+void updateIndividualOpenLoopSinePwmCla(uint32_t base, float epwmIndividualAngle);
+void updateIndividualDutyPwmCla(uint32_t base, float phaseDuty);
+void updateElectricalAngleCla(void);
+void updatePllValidityCla(void);
+void computeDqAxisVoltagesCla(void);
+void runDqVoltageControllerCla(void);
+void runDcVoltageControllerCla(void);
+void computeDqAxisCurrentsCla(void);
+void runDqCurrentControllerCla(void);
+float clampUnitFloatCla(float val);
+float clampFloatCla(float val, float low, float high);
+
+//*****************************************************************************
+//
+//! Control Law Accelerator (CLA) Task 1 function. Configured in SysConfig to
+//! trigger when EPWM1 interrupt triggers. Executes PLL/angle selection,
+//! voltage/current transforms, control loops, and PWM updates once per
+//! switching period to reduce computational burden on CPU.
+//!
+//! \return None.
+//
+//*****************************************************************************
+__interrupt void Cla1Task1(void) {
+    updateElectricalAngleCla();
+    updatePllValidityCla();
+    computeDqAxisVoltagesCla();
+    runDqVoltageControllerCla();
+    runDcVoltageControllerCla();
+    computeDqAxisCurrentsCla();
+    runDqCurrentControllerCla();
+    if (controlMode == 0u) {
+        updateOpenLoopSinePwmsCla();
+    } else {
+        updateClosedLoopCurrentPwmsCla();
+    }
+}
+
+//*****************************************************************************
+//
+//! Select the electrical angle source:
+//!  - open-loop rotating angle from CPU (legacy behavior), or
+//!  - SRF-PLL angle estimated from measured phase voltages.
+//!
+//! \return None.
+//
+//*****************************************************************************
+void updateElectricalAngleCla(void) {
+    if ((angleSourceSelect == 0u) && (controlMode != 3u)) {
+        electricalAngle = epwmAngles[0];
+        return;
+    }
+
+    {
+        float vAlpha = 0.6666666667f * phaseVoltageU - 0.3333333333f * (phaseVoltageV + phaseVoltageW);
+        float vBeta  = 0.5773502692f * (phaseVoltageV - phaseVoltageW);
+        float sinTheta = CLAsin(pllTheta);
+        float cosTheta = CLAsin(pllTheta + PI * 0.5f);
+        float omegaErr;
+
+        pllVq = -vAlpha * sinTheta + vBeta * cosTheta;
+
+        pllIntegrator += pllKi * controlPeriodSec * pllVq;
+        pllIntegrator = clampFloatCla(pllIntegrator, -2.0f * PI2 * 200.0f, 2.0f * PI2 * 200.0f);
+
+        omegaErr = pllKp * pllVq + pllIntegrator;
+        pllOmega = pllOmegaNom + omegaErr;
+        pllOmega = clampFloatCla(pllOmega, 2.0f * PI2 * 10.0f, 2.0f * PI2 * 1000.0f);
+
+        pllTheta += pllOmega * controlPeriodSec;
+        if (pllTheta >= PI2)
+            pllTheta -= PI2;
+        else if (pllTheta < 0.0f)
+            pllTheta += PI2;
+
+        electricalAngle = pllTheta;
+    }
+}
+
+//*****************************************************************************
+//
+//! Evaluate PLL lock status using q-axis voltage residual and frequency error.
+//! Applies debounce/hysteresis counters for robust lock detection.
+//!
+//! \return None.
+//
+//*****************************************************************************
+void updatePllValidityCla(void) {
+    float vqAbs;
+    uint16_t pllInUse = ((angleSourceSelect == 1u) || (controlMode == 3u)) ? 1u : 0u;
+
+    if (pllInUse == 0u) {
+        pllFreqErrHz = 0.0f;
+        pllLockCounter = 0u;
+        pllLocked = 0u;
+        pllError = 0u;
+        return;
+    }
+
+    pllFreqErrHz = (pllOmega - pllOmegaNom) / PI2;
+    if (pllFreqErrHz < 0.0f)
+        pllFreqErrHz = -pllFreqErrHz;
+
+    vqAbs = pllVq;
+    if (vqAbs < 0.0f)
+        vqAbs = -vqAbs;
+
+    if ((vqAbs <= PLL_LOCK_VQ_ABS_MAX_V) && (pllFreqErrHz <= PLL_LOCK_FREQ_ERR_MAX_HZ)) {
+        if (pllLockCounter < PLL_LOCK_COUNT_ON)
+            pllLockCounter++;
+    } else {
+        if (pllLockCounter > 0u)
+            pllLockCounter--;
+    }
+
+    if (pllLockCounter >= PLL_LOCK_COUNT_ON)
+        pllLocked = 1u;
+    else if (pllLockCounter <= PLL_LOCK_COUNT_OFF)
+        pllLocked = 0u;
+
+    pllError = (pllLocked == 0u) ? 1u : 0u;
+}
+
+//*****************************************************************************
+//
+//! Compute dq-axis currents from sampled phase currents and electrical angle
+//! using Clarke + Park transforms.
+//!
+//! \return None.
+//
+//*****************************************************************************
+void computeDqAxisCurrentsCla(void) {
+    float iAlpha = 0.6666666667f * phaseCurrentU - 0.3333333333f * (phaseCurrentV + phaseCurrentW);
+    float iBeta  = 0.5773502692f * (phaseCurrentV - phaseCurrentW);
+    float sinTheta = CLAsin(electricalAngle);
+    float cosTheta = CLAsin(electricalAngle + PI * 0.5f);
+
+    idCurrentMeas = iAlpha * cosTheta + iBeta * sinTheta;
+    iqCurrentMeas = -iAlpha * sinTheta + iBeta * cosTheta;
+}
+
+//*****************************************************************************
+//
+//! Compute dq-axis voltages from sampled phase voltages and selected angle.
+//!
+//! \return None.
+//
+//*****************************************************************************
+void computeDqAxisVoltagesCla(void) {
+    float vAlpha = 0.6666666667f * phaseVoltageU - 0.3333333333f * (phaseVoltageV + phaseVoltageW);
+    float vBeta  = 0.5773502692f * (phaseVoltageV - phaseVoltageW);
+    float sinTheta = CLAsin(electricalAngle);
+    float cosTheta = CLAsin(electricalAngle + PI * 0.5f);
+
+    vdVoltageMeas = vAlpha * cosTheta + vBeta * sinTheta;
+    vqVoltageMeas = -vAlpha * sinTheta + vBeta * cosTheta;
+}
+
+//*****************************************************************************
+//
+//! Outer voltage loop (optional, active only in cascaded mode).
+//! Generates dq current references for inner current loop.
+//!
+//! \return None.
+//
+//*****************************************************************************
+void runDqVoltageControllerCla(void) {
+    if (controlMode != 2u) {
+        vdVoltageErr = 0.0f;
+        vqVoltageErr = 0.0f;
+        vdVoltageIntegrator = 0.0f;
+        vqVoltageIntegrator = 0.0f;
+        idRefFromVoltageLoop = 0.0f;
+        iqRefFromVoltageLoop = 0.0f;
+        return;
+    }
+
+    vdVoltageErr = vdVoltageRef - vdVoltageMeas;
+    vqVoltageErr = vqVoltageRef - vqVoltageMeas;
+
+    vdVoltageIntegrator += voltageKi * controlPeriodSec * vdVoltageErr;
+    vqVoltageIntegrator += voltageKi * controlPeriodSec * vqVoltageErr;
+    vdVoltageIntegrator = clampFloatCla(vdVoltageIntegrator, -VOLTAGE_LOOP_INT_LIMIT_A, VOLTAGE_LOOP_INT_LIMIT_A);
+    vqVoltageIntegrator = clampFloatCla(vqVoltageIntegrator, -VOLTAGE_LOOP_INT_LIMIT_A, VOLTAGE_LOOP_INT_LIMIT_A);
+
+    idRefFromVoltageLoop = clampFloatCla(voltageKp * vdVoltageErr + vdVoltageIntegrator, -VOLTAGE_LOOP_IREF_LIMIT_A, VOLTAGE_LOOP_IREF_LIMIT_A);
+    iqRefFromVoltageLoop = clampFloatCla(voltageKp * vqVoltageErr + vqVoltageIntegrator, -VOLTAGE_LOOP_IREF_LIMIT_A, VOLTAGE_LOOP_IREF_LIMIT_A);
+}
+
+//*****************************************************************************
+//
+//! Outer DC-bus loop for active rectifier mode. Generates d-axis current
+//! reference to regulate Vdc. q-axis reference is fixed to 0 in current loop.
+//!
+//! \return None.
+//
+//*****************************************************************************
+void runDcVoltageControllerCla(void) {
+    if (controlMode != 3u) {
+        vdcVoltageErr = 0.0f;
+        vdcVoltageIntegrator = 0.0f;
+        idRefFromDcVoltageLoop = 0.0f;
+        return;
+    }
+
+    vdcVoltageErr = vdcVoltageRef - dcBusVoltageMeas;
+    vdcVoltageIntegrator += dcVoltageKi * controlPeriodSec * vdcVoltageErr;
+    vdcVoltageIntegrator = clampFloatCla(vdcVoltageIntegrator, -VDC_LOOP_INT_LIMIT_A, VDC_LOOP_INT_LIMIT_A);
+
+    idRefFromDcVoltageLoop = clampFloatCla(dcVoltageKp * vdcVoltageErr + vdcVoltageIntegrator,
+                                           -VOLTAGE_LOOP_IREF_LIMIT_A,
+                                           VOLTAGE_LOOP_IREF_LIMIT_A);
+}
+
+//*****************************************************************************
+//
+//! Inner dq current controller. Computes dq current errors and PI voltage
+//! commands every switching period for closed-loop modes.
+//!
+//! \return None.
+//
+//*****************************************************************************
+void runDqCurrentControllerCla(void) {
+    float idRef;
+    float iqRef;
+    float vLimit;
+    float omegaElec;
+    float vdPi;
+    float vqPi;
+    float vdFf;
+    float vqFf;
+    uint16_t pllRequired;
+
+    if (controlMode == 0u) {
+        idCurrentErr = 0.0f;
+        iqCurrentErr = 0.0f;
+        idIntegrator = 0.0f;
+        iqIntegrator = 0.0f;
+        vdCommand = 0.0f;
+        vqCommand = 0.0f;
+        return;
+    }
+
+    pllRequired = ((angleSourceSelect == 1u) || (controlMode == 3u)) ? 1u : 0u;
+    if ((pllRequired == 1u) && (pllLocked == 0u)) {
+        idCurrentErr = 0.0f;
+        iqCurrentErr = 0.0f;
+        idIntegrator = 0.0f;
+        iqIntegrator = 0.0f;
+        vdCommand = 0.0f;
+        vqCommand = 0.0f;
+        return;
+    }
+
+    if (controlMode == 2u) {
+        idRef = idRefFromVoltageLoop;
+        iqRef = iqRefFromVoltageLoop;
+    } else if (controlMode == 3u) {
+        idRef = idRefFromDcVoltageLoop;
+        iqRef = 0.0f;
+    } else {
+        idRef = idRefCurrent;
+        iqRef = iqRefCurrent;
+    }
+
+    idCurrentErr = idRef - idCurrentMeas;
+    iqCurrentErr = iqRef - iqCurrentMeas;
+
+    vLimit = 0.5f * dcBusVoltageMeas;
+    if (vLimit < (0.5f * VDC_MIN_FOR_MODULATION_V))
+        vLimit = 0.5f * VDC_MIN_FOR_MODULATION_V;
+    if (vLimit > CURRENT_LOOP_VCMD_MAX_ABS_V)
+        vLimit = CURRENT_LOOP_VCMD_MAX_ABS_V;
+
+    idIntegrator = clampFloatCla(idIntegrator + currentKi * controlPeriodSec * idCurrentErr, -vLimit, vLimit);
+    iqIntegrator = clampFloatCla(iqIntegrator + currentKi * controlPeriodSec * iqCurrentErr, -vLimit, vLimit);
+
+    vdPi = currentKp * idCurrentErr + idIntegrator;
+    vqPi = currentKp * iqCurrentErr + iqIntegrator;
+    vdFf = CURRENT_LOOP_VOLTAGE_FF_GAIN * vdVoltageMeas;
+    vqFf = CURRENT_LOOP_VOLTAGE_FF_GAIN * vqVoltageMeas;
+
+    if (pllRequired == 1u) {
+        omegaElec = pllOmega;
+    } else {
+        if (controlPeriodSec > 0.0f)
+            omegaElec = angleStep / controlPeriodSec;
+        else
+            omegaElec = pllOmegaNom;
+    }
+
+    vdCommand = vdPi + vdFf - omegaElec * CURRENT_LOOP_DECOUPLING_L_H * iqCurrentMeas;
+    vqCommand = vqPi + vqFf + omegaElec * CURRENT_LOOP_DECOUPLING_L_H * idCurrentMeas;
+    vdCommand = clampFloatCla(vdCommand, -vLimit, vLimit);
+    vqCommand = clampFloatCla(vqCommand, -vLimit, vLimit);
+}
+
+//*****************************************************************************
+//
+//! Update EPWM counter compare values of all phases in open-loop sine PWM
+//! control mode based on current phase angles and modulation factor.
+//!
+//! \return None.
+//
+//*****************************************************************************
+void updateOpenLoopSinePwmsCla(void) {
+    updateIndividualOpenLoopSinePwmCla(myEPWM1_BASE, epwmAngles[0]);
+    updateIndividualOpenLoopSinePwmCla(myEPWM2_BASE, epwmAngles[1]);
+    updateIndividualOpenLoopSinePwmCla(myEPWM3_BASE, epwmAngles[2]);
+}
+
+//*****************************************************************************
+//
+//! Update EPWM duty cycles using closed-loop current controller output.
+//! vd/vq are transformed back to abc phase commands and mapped to [0,1] duty.
+//!
+//! \return None.
+//
+//*****************************************************************************
+void updateClosedLoopCurrentPwmsCla(void) {
+    float sinTheta = CLAsin(electricalAngle);
+    float cosTheta = CLAsin(electricalAngle + PI * 0.5f);
+    float vAlpha = vdCommand * cosTheta - vqCommand * sinTheta;                      // [V]
+    float vBeta  = vdCommand * sinTheta + vqCommand * cosTheta;                      // [V]
+    float vU = vAlpha;                                                                // [V]
+    float vV = -0.5f * vAlpha + 0.8660254038f * vBeta;                               // [V]
+    float vW = -0.5f * vAlpha - 0.8660254038f * vBeta;                               // [V]
+    float vBusHalf = 0.5f * dcBusVoltageMeas;                                         // [V]
+    float modU;
+    float modV;
+    float modW;
+
+    if (vBusHalf < (0.5f * VDC_MIN_FOR_MODULATION_V))
+        vBusHalf = 0.5f * VDC_MIN_FOR_MODULATION_V;
+
+    modU = clampUnitFloatCla(vU / vBusHalf);
+    modV = clampUnitFloatCla(vV / vBusHalf);
+    modW = clampUnitFloatCla(vW / vBusHalf);
+
+    updateIndividualDutyPwmCla(myEPWM1_BASE, (modU + 1.0f) * 0.5f);
+    updateIndividualDutyPwmCla(myEPWM2_BASE, (modV + 1.0f) * 0.5f);
+    updateIndividualDutyPwmCla(myEPWM3_BASE, (modW + 1.0f) * 0.5f);
+}
+
+//*****************************************************************************
+//
+//! Update EPWM counter compare value based on current phase angle and
+//! modulation factor.
+//!
+//! \param base is the EPWM base to update.
+//! \param epwmIndividualAngle is the current EPWM phase angle.
+//!
+//! \return None.
+//
+//*****************************************************************************
+void updateIndividualOpenLoopSinePwmCla(uint32_t base, float epwmIndividualAngle) {
+    // Sine Wave Math
+    float Sine = CLAdiv((modulationFactor*CLAsin(epwmIndividualAngle)+1.0),2.0);
+
+    // Update Counter Compare Value
+    EPWM_setCounterCompareValue(base, EPWM_COUNTER_COMPARE_A, (uint16_t)(Sine*epwmTimebasePeriod));
+}
+
+//*****************************************************************************
+//
+//! Update EPWM counter compare using an explicit duty command [0,1].
+//!
+//! \return None.
+//
+//*****************************************************************************
+void updateIndividualDutyPwmCla(uint32_t base, float phaseDuty) {
+    if (phaseDuty > 1.0f)
+        phaseDuty = 1.0f;
+    else if (phaseDuty < 0.0f)
+        phaseDuty = 0.0f;
+
+    EPWM_setCounterCompareValue(base, EPWM_COUNTER_COMPARE_A, (uint16_t)(phaseDuty * epwmTimebasePeriod));
+}
+
+//*****************************************************************************
+//
+//! Bound a scalar to [-1, 1] for normalized modulation commands.
+//!
+//! \return Saturated value.
+//
+//*****************************************************************************
+float clampUnitFloatCla(float val) {
+    if (val > 1.0f)
+        return 1.0f;
+    if (val < -1.0f)
+        return -1.0f;
+    return val;
+}
+
+//*****************************************************************************
+//
+//! Bound a scalar to user-provided limits.
+//!
+//! \return Saturated value.
+//
+//*****************************************************************************
+float clampFloatCla(float val, float low, float high) {
+    if (val > high)
+        return high;
+    if (val < low)
+        return low;
+    return val;
+}
