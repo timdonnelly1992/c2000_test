@@ -305,8 +305,14 @@ void runDqCurrentControllerCla(void) {
 
     vdPi = currentKp * idCurrentErr + idIntegrator;
     vqPi = currentKp * iqCurrentErr + iqIntegrator;
-    vdFf = CURRENT_LOOP_VOLTAGE_FF_GAIN * vdVoltageMeas;
-    vqFf = CURRENT_LOOP_VOLTAGE_FF_GAIN * vqVoltageMeas;
+
+    if (pllLocked == 1u) {
+        vdFf = CURRENT_LOOP_VOLTAGE_FF_GAIN * vdVoltageMeas;
+        vqFf = CURRENT_LOOP_VOLTAGE_FF_GAIN * vqVoltageMeas;
+    } else {
+        vdFf = 0.0f;
+        vqFf = 0.0f;
+    }
 
     if (pllRequired == 1u) {
         omegaElec = pllOmega;

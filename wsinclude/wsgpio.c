@@ -104,7 +104,7 @@ void enableOnBoardGreenLed(void) {
 //
 //*****************************************************************************
 void disableOnBoardGreenLed(void) {
-    GPIO_writePin(LED_RED_PIN,0);
+    GPIO_writePin(LED_GREEN_PIN,0);
 }
 
 //*****************************************************************************

@@ -31,7 +31,7 @@
 //
 // Globals
 //
-extern float sensor2Sums[INDEXCURRENTU];
+extern float sensor2Sums[NUMAVGSENSORS];
 extern uint16_t rmsIndex;
 extern uint16_t rmsAvgBins;
 extern uint16_t bufferIndex;

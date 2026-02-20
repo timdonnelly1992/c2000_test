@@ -37,7 +37,7 @@
 // Default Operating Parameters
 //
 #define DEFAULTSWITCHINGFREQ    20e3            // [Hz] default switching frequency
-#define DEFAULTFUNDAMENTALFREQ  300             // [Hz] default fundamental frequency
+#define DEFAULTFUNDAMENTALFREQ  60              // [Hz] default fundamental frequency
 #define DEFAULTMODFACTOR        0.01f           // [unitless, 0-1] default modulation factor
 #define DEFAULTDEADTIME         200             // [ns] default dead time
 #define DEFAULTOVERCURRENT      150             // [A] default overcurrent trip value

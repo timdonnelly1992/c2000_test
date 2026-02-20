@@ -720,7 +720,7 @@ uint16_t getSpareAdc1(void) {
 //
 //*****************************************************************************
 uint16_t getSpareAdc2(void) {
-    return ADC_readResult(myADC0_RESULT_BASE, myADC0_SPARE_ADC1);
+    return ADC_readResult(myADC0_RESULT_BASE, myADC0_SPARE_ADC2);
 }
 
 //*****************************************************************************

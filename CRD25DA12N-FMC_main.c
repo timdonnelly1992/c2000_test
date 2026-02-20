@@ -188,6 +188,12 @@ void main(void) {
         DEVICE_DELAY_US(1000);
 
         //
+        // Update relay outputs from manual commands
+        //
+        setRelay1(manualRelay1Command);
+        setRelay2(manualRelay2Command);
+
+        //
         // Check for Controller CAN Message. If Present, Decode and Update Controller
         //
         if (CAN_readMessage(myCAN0_BASE, CANOBJECTRXCONTROL, rxMsgData)) {
@@ -723,9 +729,6 @@ void setPllNominalFrequency(float gridFreqHz) {
 __interrupt void epwm1ISR(void)
 {
     uint16_t latestIndex;
-
-    setRelay1(manualRelay1Command);
-    setRelay2(manualRelay2Command);
 
     forceCurrentSocsWait();
     storeCurrentSensors();
