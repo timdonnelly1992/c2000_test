@@ -52,6 +52,11 @@ static void sciWriteHexByte(uint16_t val);
 static void sciWriteLong(long val);
 static void sciWriteUint(uint16_t val);
 static void sciWriteLabel(const char *label, long val);
+static uint16_t sciStringLength(const char *s);
+static uint16_t sciCountLongChars(long val);
+static void sciWriteSpaces(uint16_t count);
+static void sciWriteTwoCols(const char *leftLabel, long leftVal,
+                            const char *rightLabel, long rightVal);
 static long scaleToMilli(float value);
 static long scaleToDeci(float value);
 static uint16_t sciParseInt(const char *s, long *out);
@@ -145,6 +150,14 @@ void main(void) {
     initEpwm();
 
     //
+    // Apply offset correction to sensors and set overcurrent protection before
+    // enabling PWM interrupts/global interrupts (avoids ADC-flag contention
+    // with epwm1ISR during calibration).
+    //
+    setSensorOffsetCorrection();
+    setOvercurrentProtection(DEFAULTOVERCURRENT);
+
+    //
     // Enable sync and clock to PWM
     //
     SysCtl_enablePeripheral(SYSCTL_PERIPH_CLK_TBCLKSYNC);
@@ -160,12 +173,6 @@ void main(void) {
     //
     EINT;
     ERTM;
-
-    //
-    // Apply offset correction to sensors and set overcurrent protection
-    //
-    setSensorOffsetCorrection();
-    setOvercurrentProtection(DEFAULTOVERCURRENT);
 
     //
     // Initialize Variables
@@ -296,6 +303,51 @@ static void sciWriteLabel(const char *label, long val) {
     sciWriteLong(val);
 }
 
+static uint16_t sciStringLength(const char *s) {
+    uint16_t len = 0u;
+    while (s[len] != '\0')
+        len++;
+    return len;
+}
+
+static uint16_t sciCountLongChars(long val) {
+    uint16_t chars = 1u;
+    unsigned long uv;
+
+    if (val < 0) {
+        chars++;
+        uv = (unsigned long)(-val);
+    } else {
+        uv = (unsigned long)val;
+    }
+
+    while (uv >= 10u) {
+        uv /= 10u;
+        chars++;
+    }
+
+    return chars;
+}
+
+static void sciWriteSpaces(uint16_t count) {
+    while (count-- > 0u)
+        sciWriteChar(' ');
+}
+
+static void sciWriteTwoCols(const char *leftLabel, long leftVal,
+                            const char *rightLabel, long rightVal) {
+    const uint16_t col2Start = 28u;
+    uint16_t used = sciStringLength(leftLabel) + sciCountLongChars(leftVal);
+
+    sciWriteLabel(leftLabel, leftVal);
+    if (used < col2Start)
+        sciWriteSpaces((uint16_t)(col2Start - used));
+    else
+        sciWriteSpaces(3u);
+    sciWriteLabel(rightLabel, rightVal);
+    sciWriteString("\r\n");
+}
+
 static long scaleToMilli(float value) {
     if (value >= 0.0f)
         return (long)(value * 1000.0f + 0.5f);
@@ -380,46 +432,32 @@ static uint16_t sciParseFloat(const char *s, float *out) {
 }
 
 static void sendSciSnapshot(void) {
+    long pllFreqHzRounded;
+
+    pllFreqHzRounded = (long)((pllOmega / PI2) + ((pllOmega >= 0.0f) ? 0.5f : -0.5f));
+
     sciWriteString("\r\n--- SNAPSHOT ---\r\n");
 
-    sciWriteString("mode=");        sciWriteUint(controlMode);
-    sciWriteString(" angleSource="); sciWriteUint(angleSourceSelect);
-    sciWriteString(" pllLock=");     sciWriteUint(pllLocked);
-    sciWriteString(" pllErr=");      sciWriteUint(pllError);
-    sciWriteString("\r\n");
-
-    sciWriteString("relay1Cmd=");    sciWriteUint(manualRelay1Command);
-    sciWriteString(" relay2Cmd=");   sciWriteUint(manualRelay2Command);
-    sciWriteString(" relay1=");      sciWriteUint(getRelay1());
-    sciWriteString(" relay2=");      sciWriteUint(getRelay2());
-    sciWriteString("\r\n");
+    sciWriteTwoCols("mode=", (long)controlMode,
+                    "angleSource=", (long)angleSourceSelect);
+    sciWriteTwoCols("relay1Cmd=", (long)manualRelay1Command,
+                    "relay2Cmd=", (long)manualRelay2Command);
 
     sciWriteString("modCmd_milli="); sciWriteLong(scaleToMilli(modulationFactor));
     sciWriteString("\r\n");
 
-    sciWriteLabel("id_mA=",     scaleToMilli(idCurrentMeas));
-    sciWriteLabel(" iq_mA=",    scaleToMilli(iqCurrentMeas));
-    sciWriteLabel(" idRef_mA=", scaleToMilli(idRefCurrent));
-    sciWriteLabel(" iqRef_mA=", scaleToMilli(iqRefCurrent));
-    sciWriteString("\r\n");
-
-    sciWriteLabel("vdCmd_dV=",  scaleToDeci(vdCommand));
-    sciWriteLabel(" vqCmd_dV=", scaleToDeci(vqCommand));
-    sciWriteString("\r\n");
-
-    sciWriteLabel("vdMeas_dV=",  scaleToDeci(vdVoltageMeas));
-    sciWriteLabel(" vqMeas_dV=", scaleToDeci(vqVoltageMeas));
-    sciWriteLabel(" vdRef_dV=",  scaleToDeci(vdVoltageRef));
-    sciWriteLabel(" vqRef_dV=",  scaleToDeci(vqVoltageRef));
-    sciWriteString("\r\n");
-
-    sciWriteLabel("vdc_dV=",    scaleToDeci(dcBusVoltageMeas));
-    sciWriteLabel(" vdcRef_dV=", scaleToDeci(vdcVoltageRef));
-    sciWriteString("\r\n");
-
-    sciWriteLabel("pllFreqErr_mHz=", scaleToMilli(pllFreqErrHz));
-    sciWriteLabel(" pllVq_mV=",      scaleToMilli(pllVq));
-    sciWriteString("\r\n");
+    sciWriteTwoCols("idRef_mA=", scaleToMilli(idRefCurrent),
+                    "iqRef_mA=", scaleToMilli(iqRefCurrent));
+    sciWriteTwoCols("id_mA=", scaleToMilli(idCurrentMeas),
+                    "iq_mA=", scaleToMilli(iqCurrentMeas));
+    sciWriteTwoCols("vdRef_dV=", scaleToDeci(vdVoltageRef),
+                    "vqRef_dV=", scaleToDeci(vqVoltageRef));
+    sciWriteTwoCols("vdMeas_dV=", scaleToDeci(vdVoltageMeas),
+                    "vqMeas_dV=", scaleToDeci(vqVoltageMeas));
+    sciWriteTwoCols("vdcRef_dV=", scaleToDeci(vdcVoltageRef),
+                    "vdc_dV=", scaleToDeci(dcBusVoltageMeas));
+    sciWriteTwoCols("pllLock=", (long)pllLocked,
+                    "pllHz=", pllFreqHzRounded);
 
     sciWriteString("----------------\r\n");
 }
