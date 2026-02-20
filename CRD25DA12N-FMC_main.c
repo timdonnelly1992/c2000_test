@@ -330,6 +330,10 @@ static uint16_t sciParseInt(const char *s, long *out) {
     }
     if (digits == 0u)
         return 0u;
+    while ((*s == ' ') || (*s == '\t'))
+        s++;
+    if (*s != '\0')
+        return 0u;
     *out = neg ? -result : result;
     return 1u;
 }
@@ -365,6 +369,10 @@ static uint16_t sciParseFloat(const char *s, float *out) {
         s++;
     }
     if (digits == 0u)
+        return 0u;
+    while ((*s == ' ') || (*s == '\t'))
+        s++;
+    if (*s != '\0')
         return 0u;
     result += frac;
     *out = neg ? -result : result;
