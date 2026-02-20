@@ -29,7 +29,6 @@
 // Included Files
 //
 #include <CRD25DA12N-FMC.h>
-#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -51,7 +50,6 @@ static void initSciStatusPort(void);
 static void sciWriteString(const char *msg);
 static long scaleToMilli(float value);
 static long scaleToDeci(float value);
-static void sendSciStatusReport(void);
 static void sendSciSnapshot(void);
 static void sciPrintMenu(void);
 static void handleSciLine(const char *line);
@@ -216,7 +214,7 @@ void main(void) {
                 statusReportTicks = 100u;
             } else {
                 statusReportTicks = 0u;
-                sendSciStatusReport();
+                sendSciSnapshot();
             }
 #else
             statusReportTicks = 0u;
@@ -256,90 +254,84 @@ static long scaleToDeci(float value) {
         return (long)(value * 10.0f - 0.5f);
 }
 
-static void sendSciStatusReport(void) {
-    char txBuf[512];
-    int n;
-    uint16_t relay1;
-    uint16_t relay2;
+static void sciWriteLong(long val) {
+    char buf[12];
+    char *p = buf + sizeof(buf) - 1;
+    unsigned long uv;
+    uint16_t neg = 0u;
 
-    relay1 = getRelay1();
-    relay2 = getRelay2();
+    *p = '\0';
+    if (val < 0) {
+        neg = 1u;
+        uv = (unsigned long)(-val);
+    } else {
+        uv = (unsigned long)val;
+    }
+    if (uv == 0u) {
+        *(--p) = '0';
+    } else {
+        while (uv > 0u) {
+            *(--p) = '0' + (char)(uv % 10u);
+            uv /= 10u;
+        }
+    }
+    if (neg)
+        *(--p) = '-';
+    sciWriteString(p);
+}
 
-    n = snprintf(txBuf, sizeof(txBuf),
-                 "mode=%u,ang=%u,relayCmd=%u,r1Cmd=%u,r2Cmd=%u,r1=%u,r2=%u,pllLock=%u,pllErr=%u,ctrlEn=%u,"
-                 "vdc_dV=%ld,id_mA=%ld,iq_mA=%ld,idRef_mA=%ld,iqRef_mA=%ld,"
-                 "vdCmd_dV=%ld,vqCmd_dV=%ld,vdMeas_dV=%ld,vqMeas_dV=%ld,"
-                 "vdRef_dV=%ld,vqRef_dV=%ld,pllFErr_mHz=%ld,pllVq_mV=%ld\r\n",
-                 (unsigned int)controlMode,
-                 (unsigned int)angleSourceSelect,
-                 (unsigned int)manualRelayCommand,
-                 (unsigned int)manualRelay1Command,
-                 (unsigned int)manualRelay2Command,
-                 (unsigned int)relay1,
-                 (unsigned int)relay2,
-                 (unsigned int)pllLocked,
-                 (unsigned int)pllError,
-                 (unsigned int)currentControlEnable,
-                 scaleToDeci(dcBusVoltageMeas),
-                 scaleToMilli(idCurrentMeas),
-                 scaleToMilli(iqCurrentMeas),
-                 scaleToMilli(idRefCurrent),
-                 scaleToMilli(iqRefCurrent),
-                 scaleToDeci(vdCommand),
-                 scaleToDeci(vqCommand),
-                 scaleToDeci(vdVoltageMeas),
-                 scaleToDeci(vqVoltageMeas),
-                 scaleToDeci(vdVoltageRef),
-                 scaleToDeci(vqVoltageRef),
-                 scaleToMilli(pllFreqErrHz),
-                 scaleToMilli(pllVq));
+static void sciWriteUint(uint16_t val) {
+    sciWriteLong((long)val);
+}
 
-    if (n > 0)
-        sciWriteString(txBuf);
+static void sciWriteLabel(const char *label, long val) {
+    sciWriteString(label);
+    sciWriteLong(val);
 }
 
 static void sendSciSnapshot(void) {
-    char txBuf[320];
-    int n;
+    sciWriteString("\r\n--- SNAPSHOT ---\r\n");
 
-    n = snprintf(txBuf, sizeof(txBuf),
-                 "\r\n--- SNAPSHOT ---\r\n"
-                 "mode=%u angleSource=%u pllLock=%u pllErr=%u\r\n"
-                 "relayCmd=%u relay1Cmd=%u relay2Cmd=%u relay1=%u relay2=%u\r\n"
-                 "modCmd_milli=%ld\r\n"
-                 "id_mA=%ld iq_mA=%ld idRef_mA=%ld iqRef_mA=%ld\r\n"
-                 "vdCmd_dV=%ld vqCmd_dV=%ld\r\n"
-                 "vdMeas_dV=%ld vqMeas_dV=%ld vdRef_dV=%ld vqRef_dV=%ld\r\n"
-                 "vdc_dV=%ld vdcRef_dV=%ld\r\n"
-                 "pllFreqErr_mHz=%ld pllVq_mV=%ld\r\n"
-                 "----------------\r\n",
-                 (unsigned int)controlMode,
-                 (unsigned int)angleSourceSelect,
-                 (unsigned int)pllLocked,
-                 (unsigned int)pllError,
-                 (unsigned int)manualRelayCommand,
-                 (unsigned int)manualRelay1Command,
-                 (unsigned int)manualRelay2Command,
-                 (unsigned int)getRelay1(),
-                 (unsigned int)getRelay2(),
-                 scaleToMilli(modulationFactor),
-                 scaleToMilli(idCurrentMeas),
-                 scaleToMilli(iqCurrentMeas),
-                 scaleToMilli(idRefCurrent),
-                 scaleToMilli(iqRefCurrent),
-                 scaleToDeci(vdCommand),
-                 scaleToDeci(vqCommand),
-                 scaleToDeci(vdVoltageMeas),
-                 scaleToDeci(vqVoltageMeas),
-                 scaleToDeci(vdVoltageRef),
-                 scaleToDeci(vqVoltageRef),
-                 scaleToDeci(dcBusVoltageMeas),
-                 scaleToDeci(vdcVoltageRef),
-                 scaleToMilli(pllFreqErrHz),
-                 scaleToMilli(pllVq));
+    sciWriteString("mode=");        sciWriteUint(controlMode);
+    sciWriteString(" angleSource="); sciWriteUint(angleSourceSelect);
+    sciWriteString(" pllLock=");     sciWriteUint(pllLocked);
+    sciWriteString(" pllErr=");      sciWriteUint(pllError);
+    sciWriteString("\r\n");
 
-    if (n > 0)
-        sciWriteString(txBuf);
+    sciWriteString("relay1Cmd=");    sciWriteUint(manualRelay1Command);
+    sciWriteString(" relay2Cmd=");   sciWriteUint(manualRelay2Command);
+    sciWriteString(" relay1=");      sciWriteUint(getRelay1());
+    sciWriteString(" relay2=");      sciWriteUint(getRelay2());
+    sciWriteString("\r\n");
+
+    sciWriteString("modCmd_milli="); sciWriteLong(scaleToMilli(modulationFactor));
+    sciWriteString("\r\n");
+
+    sciWriteLabel("id_mA=",     scaleToMilli(idCurrentMeas));
+    sciWriteLabel(" iq_mA=",    scaleToMilli(iqCurrentMeas));
+    sciWriteLabel(" idRef_mA=", scaleToMilli(idRefCurrent));
+    sciWriteLabel(" iqRef_mA=", scaleToMilli(iqRefCurrent));
+    sciWriteString("\r\n");
+
+    sciWriteLabel("vdCmd_dV=",  scaleToDeci(vdCommand));
+    sciWriteLabel(" vqCmd_dV=", scaleToDeci(vqCommand));
+    sciWriteString("\r\n");
+
+    sciWriteLabel("vdMeas_dV=",  scaleToDeci(vdVoltageMeas));
+    sciWriteLabel(" vqMeas_dV=", scaleToDeci(vqVoltageMeas));
+    sciWriteLabel(" vdRef_dV=",  scaleToDeci(vdVoltageRef));
+    sciWriteLabel(" vqRef_dV=",  scaleToDeci(vqVoltageRef));
+    sciWriteString("\r\n");
+
+    sciWriteLabel("vdc_dV=",    scaleToDeci(dcBusVoltageMeas));
+    sciWriteLabel(" vdcRef_dV=", scaleToDeci(vdcVoltageRef));
+    sciWriteString("\r\n");
+
+    sciWriteLabel("pllFreqErr_mHz=", scaleToMilli(pllFreqErrHz));
+    sciWriteLabel(" pllVq_mV=",      scaleToMilli(pllVq));
+    sciWriteString("\r\n");
+
+    sciWriteString("----------------\r\n");
 }
 
 typedef enum {
@@ -368,9 +360,7 @@ static void sciPrintMenu(void) {
     sciWriteString("5: Set angle source (0=open-loop angle,1=PLL)\r\n");
     sciWriteString("6: Change voltage refs (Vd/Vq in V)\r\n");
     sciWriteString("7: Change DC-bus voltage ref (Vdc in V)\r\n");
-    sciWriteString("8: Print snapshot now\r\n");
-    sciWriteString("9: Set open-loop duty command (0.0 to 1.0)\r\n");
-    sciWriteString("A: Set open-loop duty command (0.0 to 1.0)\r\n");
+    sciWriteString("8: Set open-loop duty command (0.0 to 1.0)\r\n");
     sciWriteString("S: Print snapshot now\r\n");
     sciWriteString("h: Show menu\r\n");
     sciWriteString("> ");
@@ -431,10 +421,6 @@ static void handleSciLine(const char *line) {
                 sciWriteString("\r\nEnter Vdc reference (V): ");
                 break;
             case '8':
-                sendSciSnapshot();
-                sciWriteString("> ");
-                break;
-            case '9':
                 gSciMenuState = SCI_MENU_WAIT_DUTY;
                 sciWriteString("\r\nEnter duty command [0.0..1.0]: ");
                 break;
@@ -442,11 +428,6 @@ static void handleSciLine(const char *line) {
             case 'S':
                 sendSciSnapshot();
                 sciWriteString("> ");
-                break;
-            case 'a':
-            case 'A':
-                gSciMenuState = SCI_MENU_WAIT_DUTY;
-                sciWriteString("\r\nEnter duty command [0.0..1.0]: ");
                 break;
             default:
                 sciWriteString("\r\nUnknown command. Type 'h' for menu.\r\n> ");
@@ -607,24 +588,33 @@ static uint16_t sciConsoleInputPending(void) {
     return SCI_isDataAvailableNonFIFO(mySCIA_BASE) ? 1u : 0u;
 }
 
-static void sciDebugRxByte(uint16_t ch) {
-    char buf[32];
-    char printable = '.';
-    uint16_t byteVal = (ch & 0x00FFu);
-
-    if ((byteVal >= 32u) && (byteVal <= 126u)) {
-        printable = (char)byteVal;
-    }
-
-    snprintf(buf, sizeof(buf), "\r\n[SCI RX] 0x%02X '%c'\r\n", (unsigned)byteVal, printable);
+static void sciWriteHexByte(uint16_t val) {
+    const char hex[] = "0123456789ABCDEF";
+    char buf[3];
+    buf[0] = hex[(val >> 4u) & 0x0Fu];
+    buf[1] = hex[val & 0x0Fu];
+    buf[2] = '\0';
     sciWriteString(buf);
 }
 
+static void sciDebugRxByte(uint16_t ch) {
+    uint16_t byteVal = (ch & 0x00FFu);
+    char printable = '.';
+
+    if ((byteVal >= 32u) && (byteVal <= 126u))
+        printable = (char)byteVal;
+
+    sciWriteString("\r\n[SCI RX] 0x");
+    sciWriteHexByte(byteVal);
+    sciWriteString(" '");
+    SCI_writeCharBlockingNonFIFO(mySCIA_BASE, (uint16_t)printable);
+    sciWriteString("'\r\n");
+}
+
 static void sciDebugRxStatus(uint16_t status) {
-    char buf[64];
-    snprintf(buf, sizeof(buf), "\r\n[SCI RX ERROR] RXST=0x%02X (resetting SCI)\r\n",
-             (unsigned)(status & 0x00FFu));
-    sciWriteString(buf);
+    sciWriteString("\r\n[SCI RX ERROR] RXST=0x");
+    sciWriteHexByte(status & 0x00FFu);
+    sciWriteString(" (resetting SCI)\r\n");
 }
 
 void setCurrentControllerMode(uint16_t enable) {
