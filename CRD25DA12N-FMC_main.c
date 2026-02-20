@@ -460,9 +460,9 @@ static void sciPrintMenu(void) {
 static uint16_t sciIsCancelCommand(const char *line) {
     if (line[0] == '\0')
         return 1u;
-    if ((line[0] == 'q') || (line[0] == 'Q'))
-        return 1u;
-    if ((line[0] == 'x') || (line[0] == 'X'))
+    if (((line[0] == 'q') || (line[0] == 'Q') ||
+         (line[0] == 'x') || (line[0] == 'X')) &&
+        ((line[1] == '\0') || (line[1] == ' ') || (line[1] == '\t')))
         return 1u;
     return 0u;
 }
