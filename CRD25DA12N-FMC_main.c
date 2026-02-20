@@ -29,27 +29,33 @@
 // Included Files
 //
 #include <CRD25DA12N-FMC.h>
-#include <stdlib.h>
 #include <string.h>
 
 #define SCI_RX_DEBUG 0u
-#define SCI_RX_RING_SIZE 128u
-#define SCI_MENU_BUILD_TAG "SCI_MENU_DEBUG_2026_02_15_A"
+#define SCI_MENU_BUILD_TAG "SCI_MENU_DEBUG_2026_02_20_A"
 #define SCI_MENU_ONLY_MODE 0u
 #define SCI_PERIODIC_STATUS_ENABLE 0u
 #define SCI_CONSOLE_BAUD 115200u
+#define SCI_TX_TIMEOUT 120000u
 
 #ifndef mySCIA_BASE
 #define mySCIA_BASE SCIA_BASE
 #endif
 
 //
-// Local function prototypes
+// Local function prototypes - SCI
 //
 static void initSciStatusPort(void);
+static void sciWriteChar(char c);
 static void sciWriteString(const char *msg);
+static void sciWriteHexByte(uint16_t val);
+static void sciWriteLong(long val);
+static void sciWriteUint(uint16_t val);
+static void sciWriteLabel(const char *label, long val);
 static long scaleToMilli(float value);
 static long scaleToDeci(float value);
+static uint16_t sciParseInt(const char *s, long *out);
+static uint16_t sciParseFloat(const char *s, float *out);
 static void sendSciSnapshot(void);
 static void sciPrintMenu(void);
 static void handleSciLine(const char *line);
@@ -233,25 +239,26 @@ static void initSciStatusPort(void) {
     SCI_enableModule(mySCIA_BASE);
 }
 
+static void sciWriteChar(char c) {
+    volatile uint32_t timeout = SCI_TX_TIMEOUT;
+    while (!SCI_isSpaceAvailableNonFIFO(mySCIA_BASE)) {
+        if (--timeout == 0u)
+            return;
+    }
+    SCI_writeCharNonBlocking(mySCIA_BASE, (uint16_t)c);
+}
+
 static void sciWriteString(const char *msg) {
     while (*msg != '\0') {
-        SCI_writeCharBlockingNonFIFO(mySCIA_BASE, (uint16_t)(*msg));
+        sciWriteChar(*msg);
         msg++;
     }
 }
 
-static long scaleToMilli(float value) {
-    if (value >= 0.0f)
-        return (long)(value * 1000.0f + 0.5f);
-    else
-        return (long)(value * 1000.0f - 0.5f);
-}
-
-static long scaleToDeci(float value) {
-    if (value >= 0.0f)
-        return (long)(value * 10.0f + 0.5f);
-    else
-        return (long)(value * 10.0f - 0.5f);
+static void sciWriteHexByte(uint16_t val) {
+    const char hex[] = "0123456789ABCDEF";
+    sciWriteChar(hex[(val >> 4u) & 0x0Fu]);
+    sciWriteChar(hex[val & 0x0Fu]);
 }
 
 static void sciWriteLong(long val) {
@@ -287,6 +294,81 @@ static void sciWriteUint(uint16_t val) {
 static void sciWriteLabel(const char *label, long val) {
     sciWriteString(label);
     sciWriteLong(val);
+}
+
+static long scaleToMilli(float value) {
+    if (value >= 0.0f)
+        return (long)(value * 1000.0f + 0.5f);
+    else
+        return (long)(value * 1000.0f - 0.5f);
+}
+
+static long scaleToDeci(float value) {
+    if (value >= 0.0f)
+        return (long)(value * 10.0f + 0.5f);
+    else
+        return (long)(value * 10.0f - 0.5f);
+}
+
+static uint16_t sciParseInt(const char *s, long *out) {
+    long result = 0;
+    uint16_t neg = 0u;
+    uint16_t digits = 0u;
+
+    while ((*s == ' ') || (*s == '\t'))
+        s++;
+    if (*s == '-') {
+        neg = 1u;
+        s++;
+    } else if (*s == '+') {
+        s++;
+    }
+    while ((*s >= '0') && (*s <= '9')) {
+        result = result * 10 + (*s - '0');
+        s++;
+        digits++;
+    }
+    if (digits == 0u)
+        return 0u;
+    *out = neg ? -result : result;
+    return 1u;
+}
+
+static uint16_t sciParseFloat(const char *s, float *out) {
+    float result = 0.0f;
+    float frac = 0.0f;
+    float divisor = 1.0f;
+    uint16_t neg = 0u;
+    uint16_t digits = 0u;
+    uint16_t hasDot = 0u;
+
+    while ((*s == ' ') || (*s == '\t'))
+        s++;
+    if (*s == '-') {
+        neg = 1u;
+        s++;
+    } else if (*s == '+') {
+        s++;
+    }
+    while (((*s >= '0') && (*s <= '9')) || ((*s == '.') && (hasDot == 0u))) {
+        if (*s == '.') {
+            hasDot = 1u;
+        } else {
+            digits++;
+            if (hasDot) {
+                divisor *= 10.0f;
+                frac += (float)(*s - '0') / divisor;
+            } else {
+                result = result * 10.0f + (float)(*s - '0');
+            }
+        }
+        s++;
+    }
+    if (digits == 0u)
+        return 0u;
+    result += frac;
+    *out = neg ? -result : result;
+    return 1u;
 }
 
 static void sendSciSnapshot(void) {
@@ -363,7 +445,18 @@ static void sciPrintMenu(void) {
     sciWriteString("8: Set open-loop duty command (0.0 to 1.0)\r\n");
     sciWriteString("S: Print snapshot now\r\n");
     sciWriteString("h: Show menu\r\n");
+    sciWriteString("(type q to cancel any sub-prompt)\r\n");
     sciWriteString("> ");
+}
+
+static uint16_t sciIsCancelCommand(const char *line) {
+    if (line[0] == '\0')
+        return 1u;
+    if ((line[0] == 'q') || (line[0] == 'Q'))
+        return 1u;
+    if ((line[0] == 'x') || (line[0] == 'X'))
+        return 1u;
+    return 0u;
 }
 
 static void handleSciLine(const char *line) {
@@ -375,54 +468,71 @@ static void handleSciLine(const char *line) {
         return;
     }
 
-    while ((*line == ' ') || (*line == '\t')) {
+    while ((*line == ' ') || (*line == '\t'))
         line++;
-    }
 
-    if (line[0] == '\0') {
-        sciWriteString("> ");
-        return;
-    }
-
+    //
+    // Home/help always works regardless of state
+    //
     if ((line[0] == 'h') || (line[0] == 'H') || (line[0] == '0')) {
         gSciMenuState = SCI_MENU_HOME;
         sciPrintMenu();
         return;
     }
 
+    //
+    // Empty line at home prompt — just reprint prompt
+    //
+    if ((gSciMenuState == SCI_MENU_HOME) && (line[0] == '\0')) {
+        sciWriteString("> ");
+        return;
+    }
+
+    //
+    // Cancel out of any sub-prompt with q/Q/x/X or empty Enter
+    //
+    if ((gSciMenuState != SCI_MENU_HOME) && sciIsCancelCommand(line)) {
+        gSciMenuState = SCI_MENU_HOME;
+        sciWriteString("\r\nCancelled.\r\n> ");
+        return;
+    }
+
+    //
+    // Home menu command dispatch
+    //
     if (gSciMenuState == SCI_MENU_HOME) {
         switch (line[0]) {
             case '1':
                 gSciMenuState = SCI_MENU_WAIT_MODE;
-                sciWriteString("\r\nEnter control mode [0..3]: ");
+                sciWriteString("\r\nEnter control mode [0..3] (q=cancel): ");
                 break;
             case '2':
                 gSciMenuState = SCI_MENU_WAIT_IDREF;
-                sciWriteString("\r\nEnter Id reference (A): ");
+                sciWriteString("\r\nEnter Id reference in A (q=cancel): ");
                 break;
             case '3':
                 gSciMenuState = SCI_MENU_WAIT_RELAY1;
-                sciWriteString("\r\nEnter Relay1 command [0/1]: ");
+                sciWriteString("\r\nEnter Relay1 command [0/1] (q=cancel): ");
                 break;
             case '4':
                 gSciMenuState = SCI_MENU_WAIT_RELAY2;
-                sciWriteString("\r\nEnter Relay2 command [0/1]: ");
+                sciWriteString("\r\nEnter Relay2 command [0/1] (q=cancel): ");
                 break;
             case '5':
                 gSciMenuState = SCI_MENU_WAIT_ANGLE_SOURCE;
-                sciWriteString("\r\nEnter angle source [0=open-loop,1=PLL]: ");
+                sciWriteString("\r\nEnter angle source [0=open-loop,1=PLL] (q=cancel): ");
                 break;
             case '6':
                 gSciMenuState = SCI_MENU_WAIT_VDREF;
-                sciWriteString("\r\nEnter Vd reference (V): ");
+                sciWriteString("\r\nEnter Vd reference in V (q=cancel): ");
                 break;
             case '7':
                 gSciMenuState = SCI_MENU_WAIT_VDCREF;
-                sciWriteString("\r\nEnter Vdc reference (V): ");
+                sciWriteString("\r\nEnter Vdc reference in V (q=cancel): ");
                 break;
             case '8':
                 gSciMenuState = SCI_MENU_WAIT_DUTY;
-                sciWriteString("\r\nEnter duty command [0.0..1.0]: ");
+                sciWriteString("\r\nEnter duty command [0.0..1.0] (q=cancel): ");
                 break;
             case 's':
             case 'S':
@@ -436,12 +546,14 @@ static void handleSciLine(const char *line) {
         return;
     }
 
+    //
+    // Sub-prompt value entry
+    //
     switch (gSciMenuState) {
         case SCI_MENU_WAIT_MODE:
-            intVal = strtol(line, NULL, 10);
-            if ((intVal < 0) || (intVal > 3))
-                sciWriteString("\r\nInvalid mode. Use 0..3.\r\n");
-            else {
+            if (sciParseInt(line, &intVal) == 0u || intVal < 0 || intVal > 3) {
+                sciWriteString("\r\nInvalid. Use 0..3.\r\n");
+            } else {
                 setControlMode((uint16_t)intVal);
                 sciWriteString("\r\nMode updated.\r\n");
             }
@@ -450,77 +562,108 @@ static void handleSciLine(const char *line) {
             break;
 
         case SCI_MENU_WAIT_IDREF:
-            floatVal = strtof(line, NULL);
-            setCurrentControllerReferences(floatVal, iqRefCurrent);
-            gSciMenuState = SCI_MENU_WAIT_IQREF;
-            sciWriteString("\r\nEnter Iq reference (A): ");
+            if (sciParseFloat(line, &floatVal) == 0u) {
+                sciWriteString("\r\nInvalid input.\r\n");
+                gSciMenuState = SCI_MENU_HOME;
+                sciWriteString("> ");
+            } else {
+                setCurrentControllerReferences(floatVal, iqRefCurrent);
+                gSciMenuState = SCI_MENU_WAIT_IQREF;
+                sciWriteString("\r\nEnter Iq reference in A (q=cancel): ");
+            }
             break;
 
         case SCI_MENU_WAIT_IQREF:
-            floatVal = strtof(line, NULL);
-            setCurrentControllerReferences(idRefCurrent, floatVal);
-            sciWriteString("\r\nCurrent references updated.\r\n");
+            if (sciParseFloat(line, &floatVal) == 0u) {
+                sciWriteString("\r\nInvalid input.\r\n");
+            } else {
+                setCurrentControllerReferences(idRefCurrent, floatVal);
+                sciWriteString("\r\nCurrent references updated.\r\n");
+            }
             gSciMenuState = SCI_MENU_HOME;
             sciWriteString("> ");
             break;
 
         case SCI_MENU_WAIT_RELAY1:
-            intVal = strtol(line, NULL, 10);
-            manualRelay1Command = (intVal == 0) ? 0u : 1u;
-            manualRelayCommand = (manualRelay1Command == manualRelay2Command) ? manualRelay1Command : 0u;
-            sciWriteString("\r\nRelay1 command updated.\r\n");
+            if (sciParseInt(line, &intVal) == 0u) {
+                sciWriteString("\r\nInvalid input.\r\n");
+            } else {
+                manualRelay1Command = (intVal == 0) ? 0u : 1u;
+                manualRelayCommand = (manualRelay1Command == manualRelay2Command) ? manualRelay1Command : 0u;
+                sciWriteString("\r\nRelay1 command updated.\r\n");
+            }
             gSciMenuState = SCI_MENU_HOME;
             sciWriteString("> ");
             break;
 
         case SCI_MENU_WAIT_RELAY2:
-            intVal = strtol(line, NULL, 10);
-            manualRelay2Command = (intVal == 0) ? 0u : 1u;
-            manualRelayCommand = (manualRelay1Command == manualRelay2Command) ? manualRelay1Command : 0u;
-            sciWriteString("\r\nRelay2 command updated.\r\n");
+            if (sciParseInt(line, &intVal) == 0u) {
+                sciWriteString("\r\nInvalid input.\r\n");
+            } else {
+                manualRelay2Command = (intVal == 0) ? 0u : 1u;
+                manualRelayCommand = (manualRelay1Command == manualRelay2Command) ? manualRelay1Command : 0u;
+                sciWriteString("\r\nRelay2 command updated.\r\n");
+            }
             gSciMenuState = SCI_MENU_HOME;
             sciWriteString("> ");
             break;
 
         case SCI_MENU_WAIT_ANGLE_SOURCE:
-            intVal = strtol(line, NULL, 10);
-            setAngleSourceMode((intVal == 0) ? 0u : 1u);
-            sciWriteString("\r\nAngle source updated.\r\n");
+            if (sciParseInt(line, &intVal) == 0u) {
+                sciWriteString("\r\nInvalid input.\r\n");
+            } else {
+                setAngleSourceMode((intVal == 0) ? 0u : 1u);
+                sciWriteString("\r\nAngle source updated.\r\n");
+            }
             gSciMenuState = SCI_MENU_HOME;
             sciWriteString("> ");
             break;
 
         case SCI_MENU_WAIT_VDREF:
-            floatVal = strtof(line, NULL);
-            setVoltageControllerReferences(floatVal, vqVoltageRef);
-            gSciMenuState = SCI_MENU_WAIT_VQREF;
-            sciWriteString("\r\nEnter Vq reference (V): ");
+            if (sciParseFloat(line, &floatVal) == 0u) {
+                sciWriteString("\r\nInvalid input.\r\n");
+                gSciMenuState = SCI_MENU_HOME;
+                sciWriteString("> ");
+            } else {
+                setVoltageControllerReferences(floatVal, vqVoltageRef);
+                gSciMenuState = SCI_MENU_WAIT_VQREF;
+                sciWriteString("\r\nEnter Vq reference in V (q=cancel): ");
+            }
             break;
 
         case SCI_MENU_WAIT_VQREF:
-            floatVal = strtof(line, NULL);
-            setVoltageControllerReferences(vdVoltageRef, floatVal);
-            sciWriteString("\r\nVoltage references updated.\r\n");
+            if (sciParseFloat(line, &floatVal) == 0u) {
+                sciWriteString("\r\nInvalid input.\r\n");
+            } else {
+                setVoltageControllerReferences(vdVoltageRef, floatVal);
+                sciWriteString("\r\nVoltage references updated.\r\n");
+            }
             gSciMenuState = SCI_MENU_HOME;
             sciWriteString("> ");
             break;
 
         case SCI_MENU_WAIT_VDCREF:
-            floatVal = strtof(line, NULL);
-            setDcVoltageControllerReference(floatVal);
-            sciWriteString("\r\nDC-bus voltage reference updated.\r\n");
+            if (sciParseFloat(line, &floatVal) == 0u) {
+                sciWriteString("\r\nInvalid input.\r\n");
+            } else {
+                setDcVoltageControllerReference(floatVal);
+                sciWriteString("\r\nDC-bus voltage reference updated.\r\n");
+            }
             gSciMenuState = SCI_MENU_HOME;
             sciWriteString("> ");
             break;
 
         case SCI_MENU_WAIT_DUTY:
-            floatVal = strtof(line, NULL);
-            if (floatVal < 0.0f)
-                floatVal = 0.0f;
-            if (floatVal > 1.0f)
-                floatVal = 1.0f;
-            modulationFactor = floatVal;
-            sciWriteString("\r\nOpen-loop duty command updated.\r\n");
+            if (sciParseFloat(line, &floatVal) == 0u) {
+                sciWriteString("\r\nInvalid input.\r\n");
+            } else {
+                if (floatVal < 0.0f)
+                    floatVal = 0.0f;
+                if (floatVal > 1.0f)
+                    floatVal = 1.0f;
+                modulationFactor = floatVal;
+                sciWriteString("\r\nDuty command updated.\r\n");
+            }
             gSciMenuState = SCI_MENU_HOME;
             sciWriteString("> ");
             break;
@@ -545,7 +688,7 @@ static void pollSciConsole(void) {
 #if SCI_RX_DEBUG
         sciDebugRxStatus(rxStatus);
 #endif
-        mySCIA_init();
+        initSciStatusPort();
         rxIdx = 0u;
         lastTerminatorWasCR = 0u;
     }
@@ -578,7 +721,7 @@ static void pollSciConsole(void) {
             lastTerminatorWasCR = 0u;
             if (rxIdx < (sizeof(rxLine) - 1u)) {
                 rxLine[rxIdx++] = c;
-                SCI_writeCharBlockingNonFIFO(mySCIA_BASE, (uint16_t)c);
+                sciWriteChar(c);
             }
         }
     }
@@ -586,15 +729,6 @@ static void pollSciConsole(void) {
 
 static uint16_t sciConsoleInputPending(void) {
     return SCI_isDataAvailableNonFIFO(mySCIA_BASE) ? 1u : 0u;
-}
-
-static void sciWriteHexByte(uint16_t val) {
-    const char hex[] = "0123456789ABCDEF";
-    char buf[3];
-    buf[0] = hex[(val >> 4u) & 0x0Fu];
-    buf[1] = hex[val & 0x0Fu];
-    buf[2] = '\0';
-    sciWriteString(buf);
 }
 
 static void sciDebugRxByte(uint16_t ch) {
@@ -607,7 +741,7 @@ static void sciDebugRxByte(uint16_t ch) {
     sciWriteString("\r\n[SCI RX] 0x");
     sciWriteHexByte(byteVal);
     sciWriteString(" '");
-    SCI_writeCharBlockingNonFIFO(mySCIA_BASE, (uint16_t)printable);
+    sciWriteChar(printable);
     sciWriteString("'\r\n");
 }
 
