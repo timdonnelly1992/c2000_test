@@ -1,0 +1,275 @@
+================================================================================
+CRD25DA12N-FMC Firmware - Architecture & ISR Overview
+Wolfspeed 25 kW Three-Phase Inverter (TI F280039C)
+Firmware Version: 2.0.0
+================================================================================
+
+TABLE OF CONTENTS
+  1. CPU vs CLA Work Distribution
+  2. ISR Configuration
+  3. Execution Timeline (per switching period)
+  4. Main Loop Tasks
+  5. Interrupt Infrastructure Details
+  6. Shared Variable Communication (CPU <-> CLA)
+  7. Control Modes
+
+================================================================================
+1. CPU vs CLA WORK DISTRIBUTION
+================================================================================
+
+CLA (Cla1Task1) -- Hardware-triggered by EPWM1INT, every switching period
+--------------------------------------------------------------------------------
+All time-critical control-law math runs on the CLA:
+
+  Step  Function                          Purpose
+  ----  --------------------------------  ------------------------------------------
+  1     updateElectricalAngleCla()        SRF-PLL angle estimation (Clarke/Park on
+                                          voltages, PI on Vq) or open-loop angle
+  2     updatePllValidityCla()            PLL lock detection with debounce hysteresis
+  3     computeDqAxisVoltagesCla()        Clarke + Park transform on phase voltages
+  4     runDqVoltageControllerCla()       Outer AC-voltage PI loop (mode 2 only)
+  5     runDcVoltageControllerCla()       Outer DC-bus voltage PI loop (mode 3 only)
+  6     computeDqAxisCurrentsCla()        Clarke + Park transform on phase currents
+  7     runDqCurrentControllerCla()       Inner dq current PI w/ feedforward+decoupling
+  8     updateOpenLoopSinePwmsCla() or    PWM compare register updates
+        updateClosedLoopCurrentPwmsCla()
+
+  Source: CRD25DA12N-FMC_cla.cla
+
+
+CPU ISR: epwm1ISR -- Runs at switching frequency on main CPU
+--------------------------------------------------------------------------------
+  - Forces 3 current ADC SOCs + busy-waits for completion
+  - Reads current ADC PPB results, converts to Amps
+  - Stores current samples in 200-element ring buffer
+  - Accumulates sum-of-squares for RMS calculation
+  - Forces 4 voltage ADC SOCs + busy-waits for completion
+  - Copies latest sensor values into CpuToCla1MsgRAM shared variables:
+      phaseCurrentU/V/W, phaseVoltageU/V/W, dcBusVoltageMeas
+  - Clears EPWM interrupt flag, acknowledges PIE Group 3
+
+  Source: CRD25DA12N-FMC_main.c (epwm1ISR, lines 899-921)
+
+
+CPU ISR: cla1Isr1 -- Runs after CLA Task 1 completes
+--------------------------------------------------------------------------------
+  - Increments open-loop phase angles (epwmAngles[0..2] += angleStep)
+  - Wraps angles at 2*pi
+  - If angleSourceSelect == 0, sets electricalAngle = epwmAngles[0]
+  - Acknowledges PIE Group 11
+
+  Source: CRD25DA12N-FMC_main.c (cla1Isr1, lines 931-948)
+
+
+CPU Main Loop -- ~1ms tick, non-time-critical
+--------------------------------------------------------------------------------
+  - SCI console polling (pollSciConsole)
+  - Relay output updates
+  - CAN message reception and parameter decode
+  - CAN telemetry transmission (every 100ms)
+  - LED toggle (every 100ms)
+  - Optional SCI status snapshot (every 100ms)
+
+  Source: CRD25DA12N-FMC_main.c (main while loop, lines 194-237)
+
+
+================================================================================
+2. ISR CONFIGURATION
+================================================================================
+
+Active ISRs:
+
+  ISR Name     Trigger Source          PIE Grp/Vec  Frequency     Purpose
+  ----------   ---------------------   -----------  ------------  -------------------------
+  epwm1ISR     EPWM1 counter = zero    3 / 1       ~20 kHz       ADC sampling + data staging
+  cla1Isr1     CLA Task 1 complete    11 / 1       ~20 kHz       Open-loop angle increment
+  Cla1Task1    EPWM1INT (hw trigger)  N/A (CLA)    ~20 kHz       Full control law execution
+
+Registration:
+  - epwm1ISR:  Interrupt_register(INT_EPWM1, &epwm1ISR)    in main()
+  - cla1Isr1:  Interrupt_register(INT_myCLA11, &cla1Isr1)  in board.c INTERRUPT_init()
+  - Cla1Task1: CLA_setTriggerSource(CLA_TASK_1, CLA_TRIGGER_EPWM1INT)  in board.c
+
+Interrupts NOT used:
+  - No CAN interrupts (polled in main loop)
+  - No SCI/UART interrupts (polled in main loop)
+  - No timer interrupts
+  - No ADC-completion interrupts for control (busy-waited in epwm1ISR)
+  - Overcurrent protection is hardware-only:
+      ADC PPB trip limits -> EPWM trip zone action (forces outputs low)
+
+Global interrupt enable sequence (main, lines 168-175):
+  1. Interrupt_register(INT_EPWM1, &epwm1ISR)
+  2. Interrupt_enable(INT_EPWM1)
+  3. EINT   -- global interrupt enable (INTM)
+  4. ERTM   -- real-time debug interrupt enable (DBGM)
+
+
+================================================================================
+3. EXECUTION TIMELINE (per switching period, ~50 us @ 20 kHz)
+================================================================================
+
+  EPWM1 counter hits zero
+    |
+    +--- epwm1ISR fires on CPU (PIE Group 3, Vector 1)
+    |    |-- Force 3 current ADC SOCs
+    |    |-- Busy-wait for current ADC completion (~1-2 us)
+    |    |-- Read current ADCs -> convert -> store buffer -> accumulate RMS
+    |    |-- Force 4 voltage ADC SOCs
+    |    |-- Busy-wait for voltage ADC completion (~1-2 us)
+    |    |-- Read voltage ADCs -> convert
+    |    |-- Copy sensor values to CpuToCla1MsgRAM shared variables
+    |    +-- Clear interrupt, acknowledge PIE
+    |
+    +--- EPWM1INT also triggers CLA Task 1 (separate hardware path)
+         |-- Reads shared sensor variables from CpuToCla1MsgRAM
+         |-- Runs PLL (if angle source = PLL)
+         |-- Runs Clarke/Park transforms (voltages and currents)
+         |-- Runs voltage loop PI (mode 2) or DC-bus loop PI (mode 3)
+         |-- Runs inner dq current PI with feedforward + decoupling
+         |-- Inverse Park/Clarke -> PWM duty -> EPWM compare register update
+         +-- On completion:
+              +--- cla1Isr1 fires on CPU (PIE Group 11, Vector 1)
+                   |-- Increment epwmAngles[0..2] by angleStep
+                   |-- Wrap at 2*pi
+                   +-- Acknowledge PIE
+
+  Note: Both epwm1ISR and Cla1Task1 are triggered by the same EPWM1 event.
+  The CLA task starts via direct hardware trigger while the CPU ISR goes
+  through PIE arbitration. In practice, the CLA reads sensor values from
+  the previous switching period (staged by the prior epwm1ISR execution).
+
+
+================================================================================
+4. MAIN LOOP TASKS
+================================================================================
+
+  Task                      Rate         Function / Source
+  ------------------------  -----------  ------------------------------------------
+  SCI console polling       Every 1ms    pollSciConsole() - non-blocking UART
+                                         state machine with menu navigation
+  Relay output updates      Every 1ms    setRelay1(), setRelay2()
+  CAN RX + param decode     Every 1ms    CAN_readMessage() -> receiveCanControls()
+                            (if avail)   -> updateClockCycleParameters() -> setAllEpwm()
+  CAN TX telemetry          Every 100ms  sendCanControls(), sendCanSensors()
+  LED toggle                Every 100ms  toggleOnBoardYellowLed()
+  SCI status snapshot       Every 100ms  sendSciSnapshot() (if SCI_PERIODIC_STATUS_ENABLE)
+
+  Main loop timing:
+    - 1ms delay per iteration (DEVICE_DELAY_US(1000))
+    - CAN TX and LED toggle every 100 iterations (100ms)
+    - SCI console polled every iteration (non-blocking)
+
+
+================================================================================
+5. INTERRUPT INFRASTRUCTURE DETAILS
+================================================================================
+
+PIE (Peripheral Interrupt Expansion):
+  - 12 interrupt groups, each with up to 16 vectors
+  - Initialized in Interrupt_initModule() and Interrupt_initVectorTable()
+  - All 224 vectors default to Interrupt_defaultHandler
+  - Custom ISRs registered via Interrupt_register()
+
+EPWM Interrupt Configuration (board.c):
+  - EPWM1, EPWM2, EPWM3 all configured as UP_DOWN counter mode
+  - Interrupt source: EPWM_INT_TBCTR_ZERO (counter reaches zero)
+  - Interrupt event count: 1 (every period)
+  - EPWM1 interrupt enabled: EPWM_enableInterrupt(myEPWM1_BASE)
+
+Trip Zone Configuration:
+  - EPWM1-3 trip zone action: EPWM_TZ_ACTION_LOW (forces output low on fault)
+  - Digital compare input: TRIPIN4 (overcurrent fault)
+  - Trip zone interrupt: EPWM_TZ_INTERRUPT_DCAEVT1 enabled
+
+CLA Configuration (board.c, myCLA1_init):
+  - Task vector: CLA_mapTaskVector(myCLA1_BASE, CLA_MVECT_1, &Cla1Task1)
+  - Trigger: CLA_setTriggerSource(CLA_TASK_1, CLA_TRIGGER_EPWM1INT)
+  - IACK enabled: CLA_enableIACK(myCLA1_BASE)
+  - Task 1 enabled: CLA_enableTasks(myCLA1_BASE, CLA_TASKFLAG_1)
+  - Program RAM: RAMLS01 (0x008000, 4KB)
+  - Data RAM: RAMLS3 (0x009800, 2KB)
+  - Constants: RAMLS2 (0x009000, 2KB)
+
+Default/System ISRs:
+  - Interrupt_defaultHandler: catches unhandled interrupts
+  - Interrupt_illegalOperationHandler: illegal CPU operations
+  - Interrupt_nmiHandler: non-maskable interrupts
+
+
+================================================================================
+6. SHARED VARIABLE COMMUNICATION (CPU <-> CLA)
+================================================================================
+
+CPU-to-CLA Message RAM (CpuToCla1MsgRAM, 0x001500, 128 bytes):
+  Sensor inputs:
+    phaseCurrentU, phaseCurrentV, phaseCurrentW     (float, Amps)
+    phaseVoltageU, phaseVoltageV, phaseVoltageW     (float, Volts)
+    dcBusVoltageMeas                                 (float, Volts)
+  Control references:
+    idRefCurrent, iqRefCurrent                       (float, Amps)
+    vdVoltageRef, vqVoltageRef                       (float, Volts)
+    vdcVoltageRef                                    (float, Volts)
+  Control gains:
+    currentKp, currentKi                             (float)
+    voltageKp, voltageKi                             (float)
+    dcVoltageKp, dcVoltageKi                         (float)
+    pllKp, pllKi, pllOmegaNom                        (float)
+  Mode/config:
+    controlMode                                      (uint16, 0-3)
+    angleSourceSelect                                (uint16, 0 or 1)
+    currentControlEnable                             (uint16)
+  EPWM parameters:
+    epwmTimebasePeriod                               (float)
+    modulationFactor                                 (float)
+    angleStep                                        (float)
+    epwmAngles[3]                                    (float array)
+    electricalAngle                                  (float)
+    controlPeriodSec                                 (float)
+
+CLA-to-CPU Message RAM (Cla1ToCpuMsgRAM, 0x001480, 128 bytes):
+  Measured dq:
+    idCurrentMeas, iqCurrentMeas                     (float, Amps)
+    vdVoltageMeas, vqVoltageMeas                     (float, Volts)
+  Control errors:
+    idCurrentErr, iqCurrentErr                       (float)
+    vdVoltageErr, vqVoltageErr                       (float)
+    vdcVoltageErr                                    (float)
+  Control outputs:
+    vdCommand, vqCommand                             (float, Volts)
+  Integrator states:
+    idIntegrator, iqIntegrator                       (float)
+    vdVoltageIntegrator, vqVoltageIntegrator         (float)
+    vdcVoltageIntegrator                             (float)
+  Outer loop references:
+    idRefFromVoltageLoop, iqRefFromVoltageLoop       (float, Amps)
+    idRefFromDcVoltageLoop                           (float, Amps)
+  PLL state:
+    pllTheta, pllOmega, pllVq                        (float)
+    pllIntegrator                                    (float)
+    pllFreqErrHz                                     (float)
+    pllLocked, pllError, pllLockCounter              (uint16)
+
+
+================================================================================
+7. CONTROL MODES
+================================================================================
+
+  Mode  Name                             CLA Behavior
+  ----  -------------------------------  ------------------------------------------
+  0     Open-loop 3-phase sine PWM       Generates sine modulation from angles +
+                                         modulation factor, no feedback
+  1     Closed-loop dq current control   PI current controller, user sets Id/Iq refs
+  2     AC voltage + current cascade     Outer voltage PI -> inner current PI,
+                                         user sets Vd/Vq refs
+  3     DC-bus voltage + current          DC-bus voltage PI -> d-axis current PI,
+        (active rectifier)               q-axis ref = 0, requires PLL
+
+  Angle sources:
+    0 = Open-loop rotating angle (epwmAngles, incremented by CPU in cla1Isr1)
+    1 = SRF-PLL estimated angle (computed by CLA from measured voltages)
+    Mode 3 always forces angle source = 1 (PLL required)
+
+================================================================================
+End of document
+================================================================================
