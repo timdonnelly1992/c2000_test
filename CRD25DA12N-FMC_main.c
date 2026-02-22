@@ -67,9 +67,10 @@ static SciMenuState gSciMenuState = SCI_MENU_HOME;
 static void initSciStatusPort(void);
 static void sciWriteChar(char c);
 static void sciWriteString(const char *msg);
+#if SCI_RX_DEBUG
 static void sciWriteHexByte(uint16_t val);
+#endif
 static void sciWriteLong(long val);
-static void sciWriteUint(uint16_t val);
 static void sciWriteLabel(const char *label, long val);
 static uint16_t sciStringLength(const char *s);
 static uint16_t sciCountLongChars(long val);
@@ -87,9 +88,13 @@ static void sciMenuReturnHome(void);
 static void sciMenuSyncRelayCommand(void);
 static void handleSciLine(const char *line);
 static void pollSciConsole(void);
+#if SCI_PERIODIC_STATUS_ENABLE
 static uint16_t sciConsoleInputPending(void);
+#endif
+#if SCI_RX_DEBUG
 static void sciDebugRxByte(uint16_t ch);
 static void sciDebugRxStatus(uint16_t status);
+#endif
 
 //
 // Main
@@ -318,11 +323,13 @@ static void sciWriteString(const char *msg) {
     }
 }
 
+#if SCI_RX_DEBUG
 static void sciWriteHexByte(uint16_t val) {
     const char hex[] = "0123456789ABCDEF";
     sciWriteChar(hex[(val >> 4u) & 0x0Fu]);
     sciWriteChar(hex[val & 0x0Fu]);
 }
+#endif
 
 static void sciWriteLong(long val) {
     char buf[12];
@@ -348,10 +355,6 @@ static void sciWriteLong(long val) {
     if (neg)
         *(--p) = '-';
     sciWriteString(p);
-}
-
-static void sciWriteUint(uint16_t val) {
-    sciWriteLong((long)val);
 }
 
 static void sciWriteLabel(const char *label, long val) {
@@ -803,10 +806,13 @@ static void pollSciConsole(void) {
     }
 }
 
+#if SCI_PERIODIC_STATUS_ENABLE
 static uint16_t sciConsoleInputPending(void) {
     return SCI_isDataAvailableNonFIFO(mySCIA_BASE) ? 1u : 0u;
 }
+#endif
 
+#if SCI_RX_DEBUG
 static void sciDebugRxByte(uint16_t ch) {
     uint16_t byteVal = (ch & 0x00FFu);
     char printable = '.';
@@ -826,6 +832,7 @@ static void sciDebugRxStatus(uint16_t status) {
     sciWriteHexByte(status & 0x00FFu);
     sciWriteString(" (resetting SCI)\r\n");
 }
+#endif
 
 void setCurrentControllerMode(uint16_t enable) {
     currentControlEnable = (enable == 0u) ? 0u : 1u;
