@@ -23,6 +23,22 @@
 #include "libraries/CLAmath/CLAmath.h"
 
 //
+// Clarke Transform Constants (3-phase abc -> stationary alpha-beta frame)
+//   CLARKE_A  =  2/3          coefficient for phase-A in alpha calculation
+//   CLARKE_B  =  1/3          coefficient for phase-B,C in alpha calculation (subtracted in code)
+//   CLARKE_C  =  1/sqrt(3)    coefficient for beta calculation
+//
+#define CLARKE_A    0.6666666667f
+#define CLARKE_B    0.3333333333f
+#define CLARKE_C    0.5773502692f
+
+//
+// Inverse Clarke Constant (alpha-beta -> 3-phase abc)
+//   INV_CLARKE_SIN60 = sqrt(3)/2    used in beta contribution to phase-B,C
+//
+#define INV_CLARKE_SIN60    0.8660254038f
+
+//
 // Function Prototypes
 //
 void updateOpenLoopSinePwmsCla(void);
@@ -80,14 +96,20 @@ void updateElectricalAngleCla(void) {
     }
 
     {
-        float vAlpha = 0.6666666667f * phaseVoltageU - 0.3333333333f * (phaseVoltageV + phaseVoltageW);
-        float vBeta  = 0.5773502692f * (phaseVoltageV - phaseVoltageW);
+        // Clarke transform: 3-phase voltages -> stationary alpha-beta frame
+        float vAlpha = CLARKE_A * phaseVoltageU - CLARKE_B * (phaseVoltageV + phaseVoltageW);
+        float vBeta  = CLARKE_C * (phaseVoltageV - phaseVoltageW);
+
+        // Park transform of voltage into PLL's estimated rotating frame.
+        // CLAsin(x + PI/2) = cos(x) — CLA has no native cosine function.
         float sinTheta = CLAsin(pllTheta);
         float cosTheta = CLAsin(pllTheta + PI * 0.5f);
         float omegaErr;
 
+        // q-axis voltage drives the PLL: when locked, Vq -> 0
         pllVq = -vAlpha * sinTheta + vBeta * cosTheta;
 
+        // PI controller on Vq error to estimate grid frequency offset
         pllIntegrator += pllKi * controlPeriodSec * pllVq;
         pllIntegrator = clampFloatCla(pllIntegrator, -2.0f * PI2 * 200.0f, 2.0f * PI2 * 200.0f);
 
@@ -95,6 +117,7 @@ void updateElectricalAngleCla(void) {
         pllOmega = pllOmegaNom + omegaErr;
         pllOmega = clampFloatCla(pllOmega, 2.0f * PI2 * 10.0f, 2.0f * PI2 * 1000.0f);
 
+        // Integrate frequency to get angle, wrap to [0, 2*pi)
         pllTheta += pllOmega * controlPeriodSec;
         if (pllTheta >= PI2)
             pllTheta -= PI2;
@@ -158,12 +181,15 @@ void updatePllValidityCla(void) {
 //
 //*****************************************************************************
 void computeDqAxisCurrentsCla(void) {
-    float iAlpha = 0.6666666667f * phaseCurrentU - 0.3333333333f * (phaseCurrentV + phaseCurrentW);
-    float iBeta  = 0.5773502692f * (phaseCurrentV - phaseCurrentW);
-    float sinTheta = CLAsin(electricalAngle);
-    float cosTheta = CLAsin(electricalAngle + PI * 0.5f);
+    // Clarke transform: 3-phase currents -> alpha-beta
+    float iAlpha = CLARKE_A * phaseCurrentU - CLARKE_B * (phaseCurrentV + phaseCurrentW);
+    float iBeta  = CLARKE_C * (phaseCurrentV - phaseCurrentW);
 
-    idCurrentMeas = iAlpha * cosTheta + iBeta * sinTheta;
+    // Park transform: alpha-beta -> rotating dq frame
+    float sinTheta = CLAsin(electricalAngle);
+    float cosTheta = CLAsin(electricalAngle + PI * 0.5f);  // cos(x) = sin(x + pi/2)
+
+    idCurrentMeas =  iAlpha * cosTheta + iBeta * sinTheta;
     iqCurrentMeas = -iAlpha * sinTheta + iBeta * cosTheta;
 }
 
@@ -175,12 +201,15 @@ void computeDqAxisCurrentsCla(void) {
 //
 //*****************************************************************************
 void computeDqAxisVoltagesCla(void) {
-    float vAlpha = 0.6666666667f * phaseVoltageU - 0.3333333333f * (phaseVoltageV + phaseVoltageW);
-    float vBeta  = 0.5773502692f * (phaseVoltageV - phaseVoltageW);
-    float sinTheta = CLAsin(electricalAngle);
-    float cosTheta = CLAsin(electricalAngle + PI * 0.5f);
+    // Clarke transform: 3-phase voltages -> alpha-beta
+    float vAlpha = CLARKE_A * phaseVoltageU - CLARKE_B * (phaseVoltageV + phaseVoltageW);
+    float vBeta  = CLARKE_C * (phaseVoltageV - phaseVoltageW);
 
-    vdVoltageMeas = vAlpha * cosTheta + vBeta * sinTheta;
+    // Park transform: alpha-beta -> rotating dq frame
+    float sinTheta = CLAsin(electricalAngle);
+    float cosTheta = CLAsin(electricalAngle + PI * 0.5f);  // cos(x) = sin(x + pi/2)
+
+    vdVoltageMeas =  vAlpha * cosTheta + vBeta * sinTheta;
     vqVoltageMeas = -vAlpha * sinTheta + vBeta * cosTheta;
 }
 
@@ -259,6 +288,7 @@ void runDqCurrentControllerCla(void) {
     float vqFf;
     uint16_t pllRequired;
 
+    // Open-loop mode: no current control, zero all states
     if (controlMode == 0u) {
         idCurrentErr = 0.0f;
         iqCurrentErr = 0.0f;
@@ -269,6 +299,7 @@ void runDqCurrentControllerCla(void) {
         return;
     }
 
+    // If PLL is required but not locked, hold output at zero (safe state)
     pllRequired = ((angleSourceSelect == 1u) || (controlMode == 3u)) ? 1u : 0u;
     if ((pllRequired == 1u) && (pllLocked == 0u)) {
         idCurrentErr = 0.0f;
@@ -280,6 +311,12 @@ void runDqCurrentControllerCla(void) {
         return;
     }
 
+    //
+    // Select current references based on control mode:
+    //   Mode 1: direct user references
+    //   Mode 2: references from outer AC-voltage loop
+    //   Mode 3: d-axis from DC-bus loop, q-axis forced to 0
+    //
     if (controlMode == 2u) {
         idRef = idRefFromVoltageLoop;
         iqRef = iqRefFromVoltageLoop;
@@ -294,18 +331,21 @@ void runDqCurrentControllerCla(void) {
     idCurrentErr = idRef - idCurrentMeas;
     iqCurrentErr = iqRef - iqCurrentMeas;
 
+    // Voltage command saturation limit: half the DC bus, floored and capped
     vLimit = 0.5f * dcBusVoltageMeas;
     if (vLimit < (0.5f * VDC_MIN_FOR_MODULATION_V))
         vLimit = 0.5f * VDC_MIN_FOR_MODULATION_V;
     if (vLimit > CURRENT_LOOP_VCMD_MAX_ABS_V)
         vLimit = CURRENT_LOOP_VCMD_MAX_ABS_V;
 
+    // PI controller with anti-windup (integrator clamped to voltage limit)
     idIntegrator = clampFloatCla(idIntegrator + currentKi * controlPeriodSec * idCurrentErr, -vLimit, vLimit);
     iqIntegrator = clampFloatCla(iqIntegrator + currentKi * controlPeriodSec * iqCurrentErr, -vLimit, vLimit);
 
     vdPi = currentKp * idCurrentErr + idIntegrator;
     vqPi = currentKp * iqCurrentErr + iqIntegrator;
 
+    // Voltage feedforward: adds measured grid voltage to reduce steady-state error
     if (pllLocked == 1u) {
         vdFf = CURRENT_LOOP_VOLTAGE_FF_GAIN * vdVoltageMeas;
         vqFf = CURRENT_LOOP_VOLTAGE_FF_GAIN * vqVoltageMeas;
@@ -314,6 +354,7 @@ void runDqCurrentControllerCla(void) {
         vqFf = 0.0f;
     }
 
+    // Electrical frequency for cross-coupling decoupling (omega * L)
     if (pllRequired == 1u) {
         omegaElec = pllOmega;
     } else {
@@ -323,6 +364,8 @@ void runDqCurrentControllerCla(void) {
             omegaElec = pllOmegaNom;
     }
 
+    // Final voltage command = PI output + feedforward + cross-coupling decoupling
+    //   Decoupling: Vd -= wL*Iq, Vq += wL*Id (cancels rotational coupling)
     vdCommand = vdPi + vdFf - omegaElec * CURRENT_LOOP_DECOUPLING_L_H * iqCurrentMeas;
     vqCommand = vqPi + vqFf + omegaElec * CURRENT_LOOP_DECOUPLING_L_H * idCurrentMeas;
     vdCommand = clampFloatCla(vdCommand, -vLimit, vLimit);
@@ -352,25 +395,27 @@ void updateOpenLoopSinePwmsCla(void) {
 //
 //*****************************************************************************
 void updateClosedLoopCurrentPwmsCla(void) {
+    // Inverse Park transform: dq voltage commands -> alpha-beta frame
     float sinTheta = CLAsin(electricalAngle);
-    float cosTheta = CLAsin(electricalAngle + PI * 0.5f);
-    float vAlpha = vdCommand * cosTheta - vqCommand * sinTheta;                      // [V]
-    float vBeta  = vdCommand * sinTheta + vqCommand * cosTheta;                      // [V]
-    float vU = vAlpha;                                                                // [V]
-    float vV = -0.5f * vAlpha + 0.8660254038f * vBeta;                               // [V]
-    float vW = -0.5f * vAlpha - 0.8660254038f * vBeta;                               // [V]
-    float vBusHalf = 0.5f * dcBusVoltageMeas;                                         // [V]
-    float modU;
-    float modV;
-    float modW;
+    float cosTheta = CLAsin(electricalAngle + PI * 0.5f);  // cos(x) = sin(x + pi/2)
+    float vAlpha = vdCommand * cosTheta - vqCommand * sinTheta;
+    float vBeta  = vdCommand * sinTheta + vqCommand * cosTheta;
 
+    // Inverse Clarke transform: alpha-beta -> 3-phase voltages
+    float vU = vAlpha;
+    float vV = -0.5f * vAlpha + INV_CLARKE_SIN60 * vBeta;
+    float vW = -0.5f * vAlpha - INV_CLARKE_SIN60 * vBeta;
+
+    // Normalize phase voltages to [-1, +1] modulation index using DC bus
+    float vBusHalf = 0.5f * dcBusVoltageMeas;
     if (vBusHalf < (0.5f * VDC_MIN_FOR_MODULATION_V))
         vBusHalf = 0.5f * VDC_MIN_FOR_MODULATION_V;
 
-    modU = clampUnitFloatCla(vU / vBusHalf);
-    modV = clampUnitFloatCla(vV / vBusHalf);
-    modW = clampUnitFloatCla(vW / vBusHalf);
+    float modU = clampUnitFloatCla(vU / vBusHalf);
+    float modV = clampUnitFloatCla(vV / vBusHalf);
+    float modW = clampUnitFloatCla(vW / vBusHalf);
 
+    // Convert [-1, +1] modulation to [0, 1] duty and write to EPWM compare registers
     updateIndividualDutyPwmCla(myEPWM1_BASE, (modU + 1.0f) * 0.5f);
     updateIndividualDutyPwmCla(myEPWM2_BASE, (modV + 1.0f) * 0.5f);
     updateIndividualDutyPwmCla(myEPWM3_BASE, (modW + 1.0f) * 0.5f);
@@ -388,11 +433,10 @@ void updateClosedLoopCurrentPwmsCla(void) {
 //
 //*****************************************************************************
 void updateIndividualOpenLoopSinePwmCla(uint32_t base, float epwmIndividualAngle) {
-    // Sine Wave Math
-    float Sine = CLAdiv((modulationFactor*CLAsin(epwmIndividualAngle)+1.0),2.0);
+    // Convert sine modulation to [0, 1] duty: duty = (m * sin(theta) + 1) / 2
+    float duty = CLAdiv((modulationFactor * CLAsin(epwmIndividualAngle) + 1.0f), 2.0f);
 
-    // Update Counter Compare Value
-    EPWM_setCounterCompareValue(base, EPWM_COUNTER_COMPARE_A, (uint16_t)(Sine*epwmTimebasePeriod));
+    EPWM_setCounterCompareValue(base, EPWM_COUNTER_COMPARE_A, (uint16_t)(duty * epwmTimebasePeriod));
 }
 
 //*****************************************************************************

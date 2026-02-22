@@ -43,6 +43,25 @@
 #endif
 
 //
+// SCI menu state machine states
+//
+typedef enum {
+    SCI_MENU_HOME = 0,
+    SCI_MENU_WAIT_MODE,
+    SCI_MENU_WAIT_IDREF,
+    SCI_MENU_WAIT_IQREF,
+    SCI_MENU_WAIT_RELAY1,
+    SCI_MENU_WAIT_RELAY2,
+    SCI_MENU_WAIT_ANGLE_SOURCE,
+    SCI_MENU_WAIT_VDREF,
+    SCI_MENU_WAIT_VQREF,
+    SCI_MENU_WAIT_VDCREF,
+    SCI_MENU_WAIT_DUTY
+} SciMenuState;
+
+static SciMenuState gSciMenuState = SCI_MENU_HOME;
+
+//
 // Local function prototypes - SCI
 //
 static void initSciStatusPort(void);
@@ -63,6 +82,9 @@ static uint16_t sciParseInt(const char *s, long *out);
 static uint16_t sciParseFloat(const char *s, float *out);
 static void sendSciSnapshot(void);
 static void sciPrintMenu(void);
+static void sciMenuEnterSubPrompt(SciMenuState nextState, const char *prompt);
+static void sciMenuReturnHome(void);
+static void sciMenuSyncRelayCommand(void);
 static void handleSciLine(const char *line);
 static void pollSciConsole(void);
 static uint16_t sciConsoleInputPending(void);
@@ -87,10 +109,14 @@ void main(void) {
     sciWriteString("\r\n[BOOT] SCI init complete\r\n");
 
     //
-    //  Initialize parameters, Disable Sync, Configure EPWMs
+    // Initialize EPWM operating parameters (switching freq, dead time, etc.)
     //
     initOperatingParameters();
-    electricalAngle          = epwmAngles[0];
+    controlPeriodSec         = 1.0f / switchingFreq;
+
+    //
+    // Zero sensor readings (populated by epwm1ISR once interrupts are enabled)
+    //
     phaseCurrentU            = 0.0f;
     phaseCurrentV            = 0.0f;
     phaseCurrentW            = 0.0f;
@@ -98,25 +124,35 @@ void main(void) {
     phaseVoltageV            = 0.0f;
     phaseVoltageW            = 0.0f;
     dcBusVoltageMeas         = 0.0f;
+    voltageSampleCounter     = 0u;
+
+    //
+    // Control mode and angle source: start in open-loop sine PWM (mode 0)
+    //
+    controlMode              = 0u;
+    currentControlEnable     = 0u;
+    angleSourceSelect        = 0u;
+    electricalAngle          = epwmAngles[0];
+
+    //
+    // Inner current loop defaults
+    //
     idRefCurrent             = 0.0f;
     iqRefCurrent             = 0.0f;
     currentKp                = 0.05f;
     currentKi                = 0.0f;
-    currentControlEnable     = 0u;
-    controlMode              = 0u;
-    angleSourceSelect        = 0u;
-    controlPeriodSec         = 1.0f / switchingFreq;
-    pllKp                    = 0.5f;
-    pllKi                    = 25.0f;
-    pllOmegaNom              = PI2 * 60.0f;
     idCurrentMeas            = 0.0f;
     iqCurrentMeas            = 0.0f;
     idCurrentErr             = 0.0f;
     iqCurrentErr             = 0.0f;
-    vdCommand                = 0.0f;
-    vqCommand                = 0.0f;
     idIntegrator             = 0.0f;
     iqIntegrator             = 0.0f;
+    vdCommand                = 0.0f;
+    vqCommand                = 0.0f;
+
+    //
+    // Outer AC-voltage loop defaults (mode 2)
+    //
     vdVoltageMeas            = 0.0f;
     vqVoltageMeas            = 0.0f;
     vdVoltageRef             = 0.0f;
@@ -129,15 +165,23 @@ void main(void) {
     vqVoltageIntegrator      = 0.0f;
     idRefFromVoltageLoop     = 0.0f;
     iqRefFromVoltageLoop     = 0.0f;
+
+    //
+    // Outer DC-bus voltage loop defaults (mode 3, active rectifier)
+    //
     vdcVoltageRef            = 700.0f;
     vdcVoltageErr            = 0.0f;
     dcVoltageKp              = 0.01f;
     dcVoltageKi              = 0.0f;
     vdcVoltageIntegrator     = 0.0f;
     idRefFromDcVoltageLoop   = 0.0f;
-    manualRelayCommand       = 0u;
-    manualRelay1Command      = 0u;
-    manualRelay2Command      = 0u;
+
+    //
+    // PLL defaults (60 Hz nominal grid)
+    //
+    pllKp                    = 0.5f;
+    pllKi                    = 25.0f;
+    pllOmegaNom              = PI2 * 60.0f;
     pllTheta                 = epwmAngles[0];
     pllOmega                 = pllOmegaNom;
     pllVq                    = 0.0f;
@@ -146,6 +190,13 @@ void main(void) {
     pllLockCounter           = 0u;
     pllLocked                = 0u;
     pllError                 = 0u;
+
+    //
+    // GPIO / relay defaults
+    //
+    manualRelayCommand       = 0u;
+    manualRelay1Command      = 0u;
+    manualRelay2Command      = 0u;
     SysCtl_disablePeripheral(SYSCTL_PERIPH_CLK_TBCLKSYNC);
     initEpwm();
 
@@ -175,12 +226,12 @@ void main(void) {
     ERTM;
 
     //
-    // Initialize Variables
+    // CAN receive buffer (used in main loop below)
     //
     uint16_t rxMsgData[8];
 
     //
-    // Green LED Always On
+    // Boot complete — turn on green LED and print console banner
     //
     enableOnBoardGreenLed();
     sciWriteString("\r\n[BOOT] Control init complete\r\n");
@@ -189,23 +240,22 @@ void main(void) {
     sciPrintMenu();
 
     //
-    // Loop Indefinitely
+    // Main background loop — runs non-time-critical tasks at ~1ms intervals.
+    // Time-critical control runs in epwm1ISR + CLA at the switching frequency.
     //
     while(1) {
         pollSciConsole();
 #if SCI_MENU_ONLY_MODE
         DEVICE_DELAY_US(100);
 #else
-        DEVICE_DELAY_US(1000);
+        DEVICE_DELAY_US(1000);  // ~1ms loop period
 
-        //
-        // Update relay outputs from manual commands
-        //
         setRelay1(manualRelay1Command);
         setRelay2(manualRelay2Command);
 
         //
-        // Check for Controller CAN Message. If Present, Decode and Update Controller
+        // Poll CAN for new control parameters. If a message arrived,
+        // decode it and reconfigure the EPWM hardware to match.
         //
         if (CAN_readMessage(myCAN0_BASE, CANOBJECTRXCONTROL, rxMsgData)) {
             receiveCanControls(rxMsgData);
@@ -214,6 +264,9 @@ void main(void) {
             setAllEpwm();
         }
 
+        //
+        // Every 100 iterations (~100ms): transmit CAN telemetry and blink LED
+        //
         if (++canTxTicks >= 100u) {
             canTxTicks = 0u;
             sendCanControls();
@@ -221,10 +274,13 @@ void main(void) {
             toggleOnBoardYellowLed();
         }
 
+        //
+        // Every ~100ms: optionally print a status snapshot over SCI
+        //
         if (++statusReportTicks >= 100u) {
 #if SCI_PERIODIC_STATUS_ENABLE
             if (sciConsoleInputPending() != 0u) {
-                statusReportTicks = 100u;
+                statusReportTicks = 100u;   // defer if user is typing
             } else {
                 statusReportTicks = 0u;
                 sendSciSnapshot();
@@ -462,22 +518,6 @@ static void sendSciSnapshot(void) {
     sciWriteString("----------------\r\n");
 }
 
-typedef enum {
-    SCI_MENU_HOME = 0,
-    SCI_MENU_WAIT_MODE,
-    SCI_MENU_WAIT_IDREF,
-    SCI_MENU_WAIT_IQREF,
-    SCI_MENU_WAIT_RELAY1,
-    SCI_MENU_WAIT_RELAY2,
-    SCI_MENU_WAIT_ANGLE_SOURCE,
-    SCI_MENU_WAIT_VDREF,
-    SCI_MENU_WAIT_VQREF,
-    SCI_MENU_WAIT_VDCREF,
-    SCI_MENU_WAIT_DUTY
-} SciMenuState;
-
-static SciMenuState gSciMenuState = SCI_MENU_HOME;
-
 static void sciPrintMenu(void) {
     sciWriteString("\r\n=== MAIN MENU (" SCI_MENU_BUILD_TAG ") ===\r\n");
     sciWriteString("0: Show menu/home\r\n");
@@ -493,6 +533,28 @@ static void sciPrintMenu(void) {
     sciWriteString("h: Show menu\r\n");
     sciWriteString("(type q to cancel any sub-prompt)\r\n");
     sciWriteString("> ");
+}
+
+//
+// SCI menu helpers: reduce repetition in sub-prompt handlers
+//
+
+// Transition to a sub-prompt state and print a prompt string.
+static void sciMenuEnterSubPrompt(SciMenuState nextState, const char *prompt) {
+    gSciMenuState = nextState;
+    sciWriteString(prompt);
+}
+
+// Return to the home menu and print the prompt character.
+static void sciMenuReturnHome(void) {
+    gSciMenuState = SCI_MENU_HOME;
+    sciWriteString("> ");
+}
+
+// Sync the combined relay command when either individual relay changes.
+static void sciMenuSyncRelayCommand(void) {
+    manualRelayCommand = (manualRelay1Command == manualRelay2Command)
+                         ? manualRelay1Command : 0u;
 }
 
 static uint16_t sciIsCancelCommand(const char *line) {
@@ -538,8 +600,8 @@ static void handleSciLine(const char *line) {
     // Cancel out of any sub-prompt with q/Q/x/X or empty Enter
     //
     if ((gSciMenuState != SCI_MENU_HOME) && sciIsCancelCommand(line)) {
-        gSciMenuState = SCI_MENU_HOME;
-        sciWriteString("\r\nCancelled.\r\n> ");
+        sciWriteString("\r\nCancelled.\r\n");
+        sciMenuReturnHome();
         return;
     }
 
@@ -548,46 +610,17 @@ static void handleSciLine(const char *line) {
     //
     if (gSciMenuState == SCI_MENU_HOME) {
         switch (line[0]) {
-            case '1':
-                gSciMenuState = SCI_MENU_WAIT_MODE;
-                sciWriteString("\r\nEnter control mode [0..3] (q=cancel): ");
-                break;
-            case '2':
-                gSciMenuState = SCI_MENU_WAIT_IDREF;
-                sciWriteString("\r\nEnter Id reference in A (q=cancel): ");
-                break;
-            case '3':
-                gSciMenuState = SCI_MENU_WAIT_RELAY1;
-                sciWriteString("\r\nEnter Relay1 command [0/1] (q=cancel): ");
-                break;
-            case '4':
-                gSciMenuState = SCI_MENU_WAIT_RELAY2;
-                sciWriteString("\r\nEnter Relay2 command [0/1] (q=cancel): ");
-                break;
-            case '5':
-                gSciMenuState = SCI_MENU_WAIT_ANGLE_SOURCE;
-                sciWriteString("\r\nEnter angle source [0=open-loop,1=PLL] (q=cancel): ");
-                break;
-            case '6':
-                gSciMenuState = SCI_MENU_WAIT_VDREF;
-                sciWriteString("\r\nEnter Vd reference in V (q=cancel): ");
-                break;
-            case '7':
-                gSciMenuState = SCI_MENU_WAIT_VDCREF;
-                sciWriteString("\r\nEnter Vdc reference in V (q=cancel): ");
-                break;
-            case '8':
-                gSciMenuState = SCI_MENU_WAIT_DUTY;
-                sciWriteString("\r\nEnter duty command [0.0..1.0] (q=cancel): ");
-                break;
+            case '1': sciMenuEnterSubPrompt(SCI_MENU_WAIT_MODE,         "\r\nEnter control mode [0..3] (q=cancel): "); break;
+            case '2': sciMenuEnterSubPrompt(SCI_MENU_WAIT_IDREF,        "\r\nEnter Id reference in A (q=cancel): ");   break;
+            case '3': sciMenuEnterSubPrompt(SCI_MENU_WAIT_RELAY1,       "\r\nEnter Relay1 command [0/1] (q=cancel): ");break;
+            case '4': sciMenuEnterSubPrompt(SCI_MENU_WAIT_RELAY2,       "\r\nEnter Relay2 command [0/1] (q=cancel): ");break;
+            case '5': sciMenuEnterSubPrompt(SCI_MENU_WAIT_ANGLE_SOURCE, "\r\nEnter angle source [0=open-loop,1=PLL] (q=cancel): "); break;
+            case '6': sciMenuEnterSubPrompt(SCI_MENU_WAIT_VDREF,        "\r\nEnter Vd reference in V (q=cancel): ");   break;
+            case '7': sciMenuEnterSubPrompt(SCI_MENU_WAIT_VDCREF,       "\r\nEnter Vdc reference in V (q=cancel): ");  break;
+            case '8': sciMenuEnterSubPrompt(SCI_MENU_WAIT_DUTY,         "\r\nEnter duty command [0.0..1.0] (q=cancel): "); break;
             case 's':
-            case 'S':
-                sendSciSnapshot();
-                sciWriteString("> ");
-                break;
-            default:
-                sciWriteString("\r\nUnknown command. Type 'h' for menu.\r\n> ");
-                break;
+            case 'S': sendSciSnapshot(); sciWriteString("> "); break;
+            default:  sciWriteString("\r\nUnknown command. Type 'h' for menu.\r\n> "); break;
         }
         return;
     }
@@ -603,19 +636,16 @@ static void handleSciLine(const char *line) {
                 setControlMode((uint16_t)intVal);
                 sciWriteString("\r\nMode updated.\r\n");
             }
-            gSciMenuState = SCI_MENU_HOME;
-            sciWriteString("> ");
+            sciMenuReturnHome();
             break;
 
         case SCI_MENU_WAIT_IDREF:
             if (sciParseFloat(line, &floatVal) == 0u) {
                 sciWriteString("\r\nInvalid input.\r\n");
-                gSciMenuState = SCI_MENU_HOME;
-                sciWriteString("> ");
+                sciMenuReturnHome();
             } else {
                 setCurrentControllerReferences(floatVal, iqRefCurrent);
-                gSciMenuState = SCI_MENU_WAIT_IQREF;
-                sciWriteString("\r\nEnter Iq reference in A (q=cancel): ");
+                sciMenuEnterSubPrompt(SCI_MENU_WAIT_IQREF, "\r\nEnter Iq reference in A (q=cancel): ");
             }
             break;
 
@@ -626,8 +656,7 @@ static void handleSciLine(const char *line) {
                 setCurrentControllerReferences(idRefCurrent, floatVal);
                 sciWriteString("\r\nCurrent references updated.\r\n");
             }
-            gSciMenuState = SCI_MENU_HOME;
-            sciWriteString("> ");
+            sciMenuReturnHome();
             break;
 
         case SCI_MENU_WAIT_RELAY1:
@@ -635,11 +664,10 @@ static void handleSciLine(const char *line) {
                 sciWriteString("\r\nInvalid input.\r\n");
             } else {
                 manualRelay1Command = (intVal == 0) ? 0u : 1u;
-                manualRelayCommand = (manualRelay1Command == manualRelay2Command) ? manualRelay1Command : 0u;
+                sciMenuSyncRelayCommand();
                 sciWriteString("\r\nRelay1 command updated.\r\n");
             }
-            gSciMenuState = SCI_MENU_HOME;
-            sciWriteString("> ");
+            sciMenuReturnHome();
             break;
 
         case SCI_MENU_WAIT_RELAY2:
@@ -647,11 +675,10 @@ static void handleSciLine(const char *line) {
                 sciWriteString("\r\nInvalid input.\r\n");
             } else {
                 manualRelay2Command = (intVal == 0) ? 0u : 1u;
-                manualRelayCommand = (manualRelay1Command == manualRelay2Command) ? manualRelay1Command : 0u;
+                sciMenuSyncRelayCommand();
                 sciWriteString("\r\nRelay2 command updated.\r\n");
             }
-            gSciMenuState = SCI_MENU_HOME;
-            sciWriteString("> ");
+            sciMenuReturnHome();
             break;
 
         case SCI_MENU_WAIT_ANGLE_SOURCE:
@@ -661,19 +688,16 @@ static void handleSciLine(const char *line) {
                 setAngleSourceMode((intVal == 0) ? 0u : 1u);
                 sciWriteString("\r\nAngle source updated.\r\n");
             }
-            gSciMenuState = SCI_MENU_HOME;
-            sciWriteString("> ");
+            sciMenuReturnHome();
             break;
 
         case SCI_MENU_WAIT_VDREF:
             if (sciParseFloat(line, &floatVal) == 0u) {
                 sciWriteString("\r\nInvalid input.\r\n");
-                gSciMenuState = SCI_MENU_HOME;
-                sciWriteString("> ");
+                sciMenuReturnHome();
             } else {
                 setVoltageControllerReferences(floatVal, vqVoltageRef);
-                gSciMenuState = SCI_MENU_WAIT_VQREF;
-                sciWriteString("\r\nEnter Vq reference in V (q=cancel): ");
+                sciMenuEnterSubPrompt(SCI_MENU_WAIT_VQREF, "\r\nEnter Vq reference in V (q=cancel): ");
             }
             break;
 
@@ -684,8 +708,7 @@ static void handleSciLine(const char *line) {
                 setVoltageControllerReferences(vdVoltageRef, floatVal);
                 sciWriteString("\r\nVoltage references updated.\r\n");
             }
-            gSciMenuState = SCI_MENU_HOME;
-            sciWriteString("> ");
+            sciMenuReturnHome();
             break;
 
         case SCI_MENU_WAIT_VDCREF:
@@ -695,8 +718,7 @@ static void handleSciLine(const char *line) {
                 setDcVoltageControllerReference(floatVal);
                 sciWriteString("\r\nDC-bus voltage reference updated.\r\n");
             }
-            gSciMenuState = SCI_MENU_HOME;
-            sciWriteString("> ");
+            sciMenuReturnHome();
             break;
 
         case SCI_MENU_WAIT_DUTY:
@@ -710,25 +732,33 @@ static void handleSciLine(const char *line) {
                 modulationFactor = floatVal;
                 sciWriteString("\r\nDuty command updated.\r\n");
             }
-            gSciMenuState = SCI_MENU_HOME;
-            sciWriteString("> ");
+            sciMenuReturnHome();
             break;
 
         default:
-            gSciMenuState = SCI_MENU_HOME;
-            sciWriteString("\r\nMenu reset.\r\n> ");
+            sciWriteString("\r\nMenu reset.\r\n");
+            sciMenuReturnHome();
             break;
     }
 }
 
+//*****************************************************************************
+//
+//! Poll the SCI UART for incoming characters and assemble them into a
+//! complete line. When a line terminator (CR or LF) is received, the
+//! accumulated line is passed to handleSciLine() for processing.
+//! Handles CR, LF, and CR+LF line endings without double-firing.
+//!
+//*****************************************************************************
 static void pollSciConsole(void) {
     static char rxLine[64];
     static uint16_t rxIdx = 0u;
-    static uint16_t lastTerminatorWasCR = 0u;
+    static uint16_t lastTerminatorWasCR = 0u;  // suppresses LF after CR+LF pair
     uint16_t ch;
     uint16_t rxStatus;
     char c;
 
+    // On any UART error (framing, overrun, etc.), reset the SCI and discard
     rxStatus = SCI_getRxStatus(mySCIA_BASE);
     if ((rxStatus & SCI_RXSTATUS_ERROR) != 0u) {
 #if SCI_RX_DEBUG
@@ -900,18 +930,30 @@ __interrupt void epwm1ISR(void)
 {
     uint16_t latestIndex;
 
+    // Sample all three phase currents (blocks until ADC completes)
     forceCurrentSocsWait();
     storeCurrentSensors();
-    forceVoltageSocsWait();
 
+    // storeCurrentSensors() advanced bufferIndex, so the sample it just
+    // wrote is at (bufferIndex - 1). Copy into CLA shared RAM.
     latestIndex = (bufferIndex == 0) ? (BUFFERSIZE - 1) : (bufferIndex - 1);
     phaseCurrentU = currentUBuffer[latestIndex];
     phaseCurrentV = currentVBuffer[latestIndex];
     phaseCurrentW = currentWBuffer[latestIndex];
-    phaseVoltageU = getVoltageU();
-    phaseVoltageV = getVoltageV();
-    phaseVoltageW = getVoltageW();
-    dcBusVoltageMeas = getVoltageDc();
+
+    //
+    // Sample voltages at decimated rate (every Nth switching period).
+    // Voltages change slowly relative to the switching frequency so
+    // the CLA reuses the previous sample on non-update cycles.
+    //
+    if (++voltageSampleCounter >= VOLTAGE_SAMPLE_DECIMATION) {
+        voltageSampleCounter = 0u;
+        forceVoltageSocsWait();
+        phaseVoltageU = getVoltageU();
+        phaseVoltageV = getVoltageV();
+        phaseVoltageW = getVoltageW();
+        dcBusVoltageMeas = getVoltageDc();
+    }
 
     //
     // Clear INT flag for this timer and Acknowledge

@@ -50,6 +50,7 @@ uint16_t    rmsAvgBins;                     // [-] # of switching periods in RMS
 uint16_t    bufferIndex;                    // [-] index counter for tracking ADC storage buffer
 uint16_t    epwmTimebasePeriod;             // [s] Enhanced PWM (EPWM) period
 uint16_t    rmsIndex = 0;                   // [-] index counter for tracking number of RMS data points
+uint16_t    voltageSampleCounter;           // [-] decimation counter for voltage ADC sampling
 float       idCurrentMeas;                  // [A] measured d-axis current
 float       iqCurrentMeas;                  // [A] measured q-axis current
 float       idCurrentErr;                   // [A] d-axis current error

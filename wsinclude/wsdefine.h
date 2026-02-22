@@ -74,6 +74,11 @@
 #define MAXDEADTIME             2000u           // [ns] maximum dead time
 
 //
+// Voltage Sampling Decimation
+//
+#define VOLTAGE_SAMPLE_DECIMATION   4   // sample voltages every Nth switching period (~5 kHz @ 20 kHz switching)
+
+//
 // Buffer/Size Parameters
 //
 #define BUFFERSIZE              200             // current/voltage storage buffer size
